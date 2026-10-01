@@ -1,33 +1,79 @@
 -- ============================================================
--- Attendance Tracking Portal — relational historical schema
--- Supabase SQL Editor -> New query -> paste -> Run
+-- Attendance Portal v3 — MANUAL daily schedule + Groq chatbot
+-- Supabase SQL Editor -> New query -> paste -> Run once.
+--
+-- Tables:
+--   subjects        (id, name, created_at)                 — your semester's subjects
+--   daily_schedule  (date, subject_id, lecture_count)      — how many classes on a date
+--   attendance_log  (date, subject_id, present_count, absent_count)
+--   holidays        (date, reason)
+--
+-- Stats formula: percentage = present / (present + absent).
+-- Holidays are excluded from "scheduled" counts and their
+-- attendance rows are cleared, so they can never penalise you.
 -- ============================================================
 
--- 1) The recurring weekly timetable (fully replaced whenever a new
---    timetable image is uploaded and processed)
-create table if not exists public.weekly_schedule (
-    id           bigint generated always as identity primary key,
-    day_of_week  text not null
-        check (day_of_week in ('Monday','Tuesday','Wednesday','Thursday',
-                               'Friday','Saturday','Sunday')),
-    subject_name text not null,
-    position     integer not null default 0,   -- lecture order within the day
-    created_at   timestamptz not null default now(),
-    constraint weekly_schedule_day_subject_unique unique (day_of_week, subject_name)
+-- 0) Retire the view from the v2 (OCR-era) schema.
+drop view if exists public.attendance_daily;
+
+-- 1) Preserve the v2 attendance history before changing the shape.
+--    Old rows were (date, subject_name, status 'present'/'absent');
+--    new rows are (date, subject_id, present_count, absent_count).
+--    The old table is renamed (NOT dropped) to attendance_log_v2_backup
+--    so your history stays queryable in the Supabase dashboard.
+do $$
+begin
+    if to_regclass('public.attendance_log') is not null
+       and not exists (
+           select 1 from information_schema.columns
+           where table_schema = 'public'
+             and table_name   = 'attendance_log'
+             and column_name  = 'present_count'
+       )
+    then
+        if to_regclass('public.attendance_log_v2_backup') is null then
+            alter table public.attendance_log rename to attendance_log_v2_backup;
+        else
+            -- a backup already exists — this old-shaped table can go
+            drop table public.attendance_log cascade;
+        end if;
+        -- the legacy index kept its old name across the rename
+        execute 'drop index if exists public.attendance_log_date_idx';
+    end if;
+end $$;
+
+-- (The v2 weekly_schedule table is untouched and simply unused now;
+--  drop it manually if you like: drop table public.weekly_schedule cascade;)
+
+-- 2) Subjects ------------------------------------------------
+create table if not exists public.subjects (
+    id         bigint generated always as identity primary key,
+    name       text not null unique,
+    created_at timestamptz not null default now()
 );
 
--- 2) Historical day-by-day attendance log (one row per date + subject)
+-- 3) How many lectures of each subject are scheduled on a date --
+create table if not exists public.daily_schedule (
+    id            bigint generated always as identity primary key,
+    date          date not null,
+    subject_id    bigint not null references public.subjects (id) on delete cascade,
+    lecture_count integer not null check (lecture_count > 0),
+    created_at    timestamptz not null default now(),
+    constraint daily_schedule_date_subject_unique unique (date, subject_id)
+);
+
+-- 4) Attendance against the scheduled count -------------------
 create table if not exists public.attendance_log (
-    id           bigint generated always as identity primary key,
-    date         date not null,
-    subject_name text not null,
-    status       text not null check (status in ('present', 'absent')),
-    created_at   timestamptz not null default now(),
-    constraint attendance_log_date_subject_unique unique (date, subject_name)
+    id            bigint generated always as identity primary key,
+    date          date not null,
+    subject_id    bigint not null references public.subjects (id) on delete cascade,
+    present_count integer not null default 0 check (present_count >= 0),
+    absent_count  integer not null default 0 check (absent_count  >= 0),
+    created_at    timestamptz not null default now(),
+    constraint attendance_log_date_subject_unique unique (date, subject_id)
 );
 
--- 3) Holidays (a holiday day's classes are simply never logged,
---    so they can never penalise the percentage)
+-- 5) Holidays (same shape as v2 — existing rows are kept) -----
 create table if not exists public.holidays (
     id         bigint generated always as identity primary key,
     date       date not null unique,
@@ -35,22 +81,27 @@ create table if not exists public.holidays (
     created_at timestamptz not null default now()
 );
 
-create index if not exists attendance_log_date_idx   on public.attendance_log (date);
-create index if not exists weekly_schedule_day_idx   on public.weekly_schedule (day_of_week);
+-- 6) Indexes --------------------------------------------------
+create index if not exists daily_schedule_date_idx    on public.daily_schedule (date);
+create index if not exists daily_schedule_subject_idx on public.daily_schedule (subject_id);
+create index if not exists attendance_log_date_idx    on public.attendance_log (date);
+create index if not exists attendance_log_subject_idx on public.attendance_log (subject_id);
 
 -- ------------------------------------------------------------
--- Row Level Security
--- The backend authenticates with your publishable/anon key, which IS
--- subject to RLS, so permissive policies are required for the app to
--- work. (If you switch the backend to the service_role key, it bypasses
--- RLS and you can drop these policies in production.)
+-- Row Level Security — the backend uses your publishable key,
+-- which IS subject to RLS, so permissive policies are required.
 -- ------------------------------------------------------------
-alter table public.weekly_schedule enable row level security;
-alter table public.attendance_log  enable row level security;
-alter table public.holidays        enable row level security;
+alter table public.subjects       enable row level security;
+alter table public.daily_schedule enable row level security;
+alter table public.attendance_log enable row level security;
+alter table public.holidays       enable row level security;
 
-drop policy if exists "allow all (app)" on public.weekly_schedule;
-create policy "allow all (app)" on public.weekly_schedule
+drop policy if exists "allow all (app)" on public.subjects;
+create policy "allow all (app)" on public.subjects
+    for all using (true) with check (true);
+
+drop policy if exists "allow all (app)" on public.daily_schedule;
+create policy "allow all (app)" on public.daily_schedule
     for all using (true) with check (true);
 
 drop policy if exists "allow all (app)" on public.attendance_log;
@@ -62,17 +113,19 @@ create policy "allow all (app)" on public.holidays
     for all using (true) with check (true);
 
 -- ------------------------------------------------------------
--- Handy view: one row per calendar day with the day's totals
+-- Seed: Semester 1 subjects (idempotent — safe to re-run)
 -- ------------------------------------------------------------
-create or replace view public.attendance_daily as
-select
-    l.date,
-    count(*) filter (where l.status = 'present')                       as present,
-    count(*) filter (where l.status = 'absent')                        as absent,
-    case when count(*) = 0 then null
-         else round(100.0 * count(*) filter (where l.status = 'present')
-                    / count(*), 1) end                                 as percent,
-    exists (select 1 from public.holidays h where h.date = l.date)     as is_holiday
-from public.attendance_log l
-group by l.date
-order by l.date;
+insert into public.subjects (name) values
+    ('Basics Of Computer and C Programming'),
+    ('Basics Of Computer and C Programming Lab'),
+    ('Front-End Web Development'),
+    ('Front-End Web Development Lab'),
+    ('Environmental Studies - I'),
+    ('Communication & Professional Skills I'),
+    ('Mini Project-I'),
+    ('Fundamentals Of Intelligent & Autonomous Systems'),
+    ('Technical Training - Advance Programming In C'),
+    ('Computational & Quantum Physics'),
+    ('Computational & Quantum Physics Lab'),
+    ('Computational Mathematics For Intelligent Systems')
+on conflict (name) do nothing;

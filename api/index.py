@@ -1,52 +1,64 @@
 """
-Attendance Tracking Portal — FastAPI backend (day-by-day historical).
+Attendance Tracking Portal — FastAPI backend v3 (manual schedule + chatbot).
 
-OCR now runs in the BROWSER (Tesseract.js) — this server only receives text.
+No OCR / image parsing / timetable extraction anywhere: lecture counts are
+entered manually in the Manage tab, attendance is marked per scheduled
+class, and Groq powers ONLY the attendance chatbot (/api/chat).
 
 Routes
 ------
-GET    /api/health                     config status (groq / supabase)
-GET    /api/schedule                   current weekly schedule
-POST   /api/schedule/text              browser-extracted text -> Groq -> weekly_schedule
-GET    /api/today?date=YYYY-MM-DD      today's date/day + only today's subjects
-POST   /api/attendance                 {date, subject_name, status} log a record
-DELETE /api/attendance?date=&subject_name=   undo a record
-POST   /api/holiday                    {date, reason?} mark holiday + clear day
-DELETE /api/holidays/{date}            undo a holiday
-GET    /api/analytics?weeks=8&end_date=week-by-week historical percentages
+GET    /api/health                       config status (groq / supabase / mode)
+GET    /api/subjects                     list subjects
+POST   /api/subjects                     add a subject
+DELETE /api/subjects/{id}                delete a subject (cascade)
+POST   /api/subjects/seed                re-insert the default Semester-1 12
+GET    /api/schedule?date=YYYY-MM-DD     one day's manual schedule
+POST   /api/schedule                     replace a day {date, entries[]}
+GET    /api/week?start=YYYY-MM-DD        full week payload (Mon..Sun) for Tab 4
+POST   /api/attendance                   {date, subject_id, present_count, absent_count}
+DELETE /api/attendance?date=&subject_id= clear one subject's marks for a day
+POST   /api/holiday                      {date, reason?} + clear day (no penalty)
+DELETE /api/holidays/{date}              undo a holiday
+GET    /api/stats?date=YYYY-MM-DD        dashboard + subject-wise stats
+POST   /api/chat                         streaming Groq chatbot (stats-injected)
 """
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Iterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # Vercel runs this file as the serverless entrypoint — make sibling modules
-# (db.py, groq_analyzer.py) importable regardless of the working dir.
+# (db.py) importable regardless of the working dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import db  # noqa: E402
-from db import DAYS, TablesMissingError  # noqa: E402
+from db import DEFAULT_SUBJECTS, TablesMissingError  # noqa: E402
 
-# Groq module builds its own client from .env (import error => server still boots)
+# Chatbot model — llama3-8b-8192 was shut down (08/2025) and its successor
+# llama-3.1-8b-instant was shut down (08/2026); Groq's official fast
+# replacement for that class is openai/gpt-oss-20b.
+CHAT_MODEL = "openai/gpt-oss-20b"
+
 GROQ_IMPORT_ERROR: Optional[str] = None
 try:
-    from groq_analyzer import analyze_daily_schedule
-except Exception as _exc:  # missing key / package
-    analyze_daily_schedule = None  # type: ignore[assignment]
+    from groq import Groq
+except Exception as _exc:  # package missing
+    Groq = None  # type: ignore[assignment]
     GROQ_IMPORT_ERROR = str(_exc)
 
-BASE_DIR = Path(__file__).resolve().parent
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-app = FastAPI(title="Attendance Tracking Portal API", version="2.0.0")
+app = FastAPI(title="Attendance Tracking Portal API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,10 +72,25 @@ app.add_middleware(
 # Request models
 # --------------------------------------------------------------------------
 
+class SubjectIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class ScheduleEntryIn(BaseModel):
+    subject_id: int = Field(ge=1)
+    lecture_count: int = Field(ge=0, le=20)
+
+
+class ScheduleIn(BaseModel):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    entries: list[ScheduleEntryIn] = Field(default_factory=list, max_length=100)
+
+
 class AttendanceIn(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    subject_name: str = Field(min_length=1, max_length=160)
-    status: Literal["present", "absent"]
+    subject_id: int = Field(ge=1)
+    present_count: int = Field(ge=0, le=20)
+    absent_count: int = Field(ge=0, le=20)
 
 
 class HolidayIn(BaseModel):
@@ -71,8 +98,9 @@ class HolidayIn(BaseModel):
     reason: str = Field(default="Holiday", max_length=200)
 
 
-class TextIn(BaseModel):
-    schedule_text: str = Field(min_length=1, max_length=20_000)
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
 # --------------------------------------------------------------------------
@@ -86,25 +114,6 @@ def _parse_date(value: Optional[str]) -> date:
         return date.fromisoformat(value)
     except ValueError:
         raise HTTPException(status_code=422, detail=f"Invalid date '{value}' (use YYYY-MM-DD)")
-
-
-def _today_payload(d: date) -> dict:
-    iso = d.isoformat()
-    day_name = d.strftime("%A")
-    holiday = _run_db(lambda: db.get_holiday(iso))
-    schedule = _run_db(db.get_schedule)
-    subjects = [] if holiday else schedule.get(day_name, [])
-    records = {r["subject_name"]: r["status"]
-               for r in _run_db(lambda: db.get_records_for_date(iso))}
-    return {
-        "date": iso,
-        "day_of_week": day_name,
-        "is_weekend": day_name in ("Saturday", "Sunday"),
-        "is_holiday": bool(holiday),
-        "holiday_reason": holiday["reason"] if holiday else None,
-        "subjects": subjects,
-        "records": records,
-    }
 
 
 def _run_db(fn):
@@ -125,73 +134,274 @@ def _run_db(fn):
         raise
 
 
-_DAY_ALIASES = {}
-for _d in DAYS:
-    _DAY_ALIASES[_d.casefold()] = _d
-    _DAY_ALIASES[_d[:3].casefold()] = _d          # mon, tue, ...
-_DAY_ALIASES.update({"wk": "Saturday", "sun": "Sunday"})
+def _pct(present: int, absent: int) -> Optional[float]:
+    """percentage = present / (present + absent); null when nothing is marked."""
+    marked = present + absent
+    return round(100.0 * present / marked, 1) if marked else None
 
 
-def _normalize_schedule(raw) -> dict[str, list[str]]:
-    """Model output -> {'Monday': [subjects...], ...} with validated days."""
-    if isinstance(raw, list):
-        # tolerate [{"day": "Monday", "subjects": [...]}, ...]
-        as_dict = {}
-        for item in raw:
-            if isinstance(item, dict):
-                day = item.get("day") or item.get("day_of_week")
-                subs = item.get("subjects") or item.get("subjects_names") or []
-                if day:
-                    as_dict[day] = subs
-        raw = as_dict
-    if not isinstance(raw, dict):
-        raise ValueError("AI response was not a JSON object keyed by day")
+def _monday(d: date) -> date:
+    return d.fromordinal(d.toordinal() - d.weekday())
 
-    schedule = {d: [] for d in DAYS}
-    for key, value in raw.items():
-        day = _DAY_ALIASES.get(str(key).strip().casefold())
-        if not day:
-            continue  # ignore non-day keys
-        if isinstance(value, str):
-            value = re.split(r"[,\n;|]+", value)
-        if not isinstance(value, list):
+
+# --------------------------------------------------------------------------
+# Aggregation (pure functions over rows — unit-testable)
+# --------------------------------------------------------------------------
+
+def _build_stats(today_iso: str) -> dict:
+    subjects = _run_db(db.get_subjects)
+    sched_rows = _run_db(db.get_all_schedule_rows)
+    att_rows = _run_db(db.get_all_attendance_rows)
+    holidays = _run_db(db.get_all_holidays)
+    holiday_set = {h["date"] for h in holidays}
+    names = {s["id"]: s["name"] for s in subjects}
+
+    agg: dict[int, dict] = {
+        s["id"]: {"id": s["id"], "name": s["name"],
+                  "scheduled": 0, "present": 0, "absent": 0}
+        for s in subjects
+    }
+
+    # scheduled counts only non-holiday dates
+    for r in sched_rows:
+        if r["date"] in holiday_set:
             continue
-        for subj in value:
-            name = re.sub(r"\s+", " ", str(subj)).strip(" •-–—")
-            if not name or len(name) > 160:
-                continue
-            if name.casefold() in {s.casefold() for s in schedule[day]}:
-                continue
-            schedule[day].append(name)
-    if not any(schedule.values()):
-        raise ValueError("Could not recognise any days/subjects in the AI output")
-    return schedule
+        slot = agg.get(r["subject_id"])
+        if slot is None:
+            agg[r["subject_id"]] = slot = {
+                "id": r["subject_id"],
+                "name": names.get(r["subject_id"], f"Subject #{r['subject_id']}"),
+                "scheduled": 0, "present": 0, "absent": 0,
+            }
+        slot["scheduled"] += int(r["lecture_count"])
+
+    for r in att_rows:
+        slot = agg.get(r["subject_id"])
+        if slot is None:
+            agg[r["subject_id"]] = slot = {
+                "id": r["subject_id"],
+                "name": names.get(r["subject_id"], f"Subject #{r['subject_id']}"),
+                "scheduled": 0, "present": 0, "absent": 0,
+            }
+        slot["present"] += int(r["present_count"])
+        slot["absent"] += int(r["absent_count"])
+
+    subject_stats = []
+    tot_sched = tot_p = tot_a = 0
+    for s in sorted(agg.values(), key=lambda x: x["name"].casefold()):
+        marked = s["present"] + s["absent"]
+        entry = {
+            **s,
+            "marked": marked,
+            "pending": max(0, s["scheduled"] - marked),
+            "percentage": _pct(s["present"], s["absent"]),
+        }
+        subject_stats.append(entry)
+        tot_sched += s["scheduled"]
+        tot_p += s["present"]
+        tot_a += s["absent"]
+
+    def day_block(iso: str) -> dict:
+        is_hol = iso in holiday_set
+        d = date.fromisoformat(iso)
+        entries = []
+        if not is_hol:
+            by_subject = {e["subject_id"]: e for e in entries_for(sched_rows, iso)}
+            att_by_subject = {a["subject_id"]: a for a in entries_for(att_rows, iso)}
+            for sid, e in by_subject.items():
+                a = att_by_subject.get(sid, {})
+                p, ab = int(a.get("present_count", 0)), int(a.get("absent_count", 0))
+                sched = int(e["lecture_count"])
+                entries.append({
+                    "subject_id": sid,
+                    "subject": names.get(sid, f"Subject #{sid}"),
+                    "scheduled": sched,
+                    "present": p,
+                    "absent": ab,
+                    "pending": max(0, sched - p - ab),
+                })
+            entries.sort(key=lambda x: x["subject"].casefold())
+        hol = next((h for h in holidays if h["date"] == iso), None)
+        return {
+            "date": iso,
+            "day_of_week": d.strftime("%A"),
+            "is_holiday": is_hol,
+            "holiday_reason": hol["reason"] if hol else None,
+            "total_scheduled": sum(e["scheduled"] for e in entries),
+            "entries": entries,
+        }
+
+    today = date.fromisoformat(today_iso)
+    tomorrow = today + timedelta(days=1)
+
+    return {
+        "as_of": today_iso,
+        "overall": {
+            "scheduled": tot_sched,
+            "present": tot_p,
+            "absent": tot_a,
+            "marked": tot_p + tot_a,
+            "pending": max(0, tot_sched - (tot_p + tot_a)),
+            "percentage": _pct(tot_p, tot_a),
+            "holidays": len(holidays),
+            "subjects": len(subjects),
+        },
+        "subjects": subject_stats,
+        "today": day_block(today.isoformat()),
+        "tomorrow": day_block(tomorrow.isoformat()),
+    }
 
 
-def _analyze_and_save(text: str, source: str) -> dict:
-    """OCR text -> Groq day-by-day JSON -> replace weekly_schedule in Supabase."""
-    if analyze_daily_schedule is None:
+def entries_for(rows: list[dict], iso: str) -> list[dict]:
+    return [r for r in rows if r.get("date") == iso]
+
+
+def _build_week(start: date) -> dict:
+    end = start + timedelta(days=6)
+    start_iso, end_iso = start.isoformat(), end.isoformat()
+
+    sched_rows = _run_db(lambda: db.get_schedule_rows_between(start_iso, end_iso))
+    att_rows = _run_db(lambda: db.get_attendance_rows_between(start_iso, end_iso))
+    holidays = _run_db(lambda: db.get_holidays_between(start_iso, end_iso))
+    subjects = _run_db(db.get_subjects)
+    names = {s["id"]: s["name"] for s in subjects}
+    holiday_map = {h["date"]: h["reason"] for h in holidays}
+
+    days = []
+    for i, day_name in enumerate(DAYS):
+        d = start + timedelta(days=i)
+        iso = d.isoformat()
+        is_holiday = iso in holiday_map
+        day_sched = [r for r in sched_rows if r["date"] == iso]
+        day_att = {r["subject_id"]: r for r in att_rows if r["date"] == iso}
+
+        entries = []
+        if not is_holiday:
+            for r in sorted(day_sched, key=lambda x: names.get(x["subject_id"], "").casefold()):
+                a = day_att.get(r["subject_id"], {})
+                p = int(a.get("present_count", 0))
+                ab = int(a.get("absent_count", 0))
+                sched = int(r["lecture_count"])
+                entries.append({
+                    "subject_id": r["subject_id"],
+                    "subject": names.get(r["subject_id"], f"Subject #{r['subject_id']}"),
+                    "lecture_count": sched,
+                    "present": p,
+                    "absent": ab,
+                    "pending": max(0, sched - p - ab),
+                })
+
+        days.append({
+            "date": iso,
+            "day_of_week": day_name,
+            "is_holiday": is_holiday,
+            "holiday_reason": holiday_map.get(iso),
+            "entries": entries,
+            "total_scheduled": sum(e["lecture_count"] for e in entries),
+            "present": sum(e["present"] for e in entries),
+            "absent": sum(e["absent"] for e in entries),
+        })
+
+    return {
+        "start": start_iso,
+        "end": end_iso,
+        "label": f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}",
+        "days": days,
+    }
+
+
+def _day_schedule_payload(iso: str) -> dict:
+    sched_rows = _run_db(lambda: db.get_schedule_rows_for_date(iso))
+    subjects = _run_db(db.get_subjects)
+    by_id = {r["subject_id"]: int(r["lecture_count"]) for r in sched_rows}
+    holiday = _run_db(lambda: db.get_holiday(iso))
+    entries = []
+    for s in subjects:
+        entries.append({
+            "subject_id": s["id"],
+            "subject": s["name"],
+            "lecture_count": by_id.get(s["id"], 0),
+        })
+    return {
+        "date": iso,
+        "is_holiday": bool(holiday),
+        "holiday_reason": holiday["reason"] if holiday else None,
+        "entries": entries,
+        "total_lectures": sum(by_id.values()),
+    }
+
+
+# --------------------------------------------------------------------------
+# Groq chatbot (stats injected into a system prompt, response streamed)
+# --------------------------------------------------------------------------
+
+def _groq_client():
+    if Groq is None:
         raise HTTPException(
             status_code=503,
-            detail=f"Groq unavailable: {GROQ_IMPORT_ERROR or 'analyze_daily_schedule not loaded'}",
+            detail=f"Groq unavailable: {GROQ_IMPORT_ERROR or 'groq package not installed'}",
         )
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY missing — set it in Vercel env vars.")
     try:
-        raw = analyze_daily_schedule(text)
+        return Groq()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Groq unavailable: {exc}")
+
+
+def _chat_system_prompt(stats: dict) -> str:
+    snapshot = json.dumps(stats, ensure_ascii=False, separators=(",", ": "))
+    return (
+        "You are the Attendance Assistant inside the user's Semester-1 attendance "
+        "portal. You are given a JSON snapshot of their LIVE attendance data — it is "
+        "authoritative; never invent subjects or numbers.\n"
+        f"Snapshot:\n{snapshot}\n\n"
+        "Rules:\n"
+        "- percentage = round(100 * present / (present + absent), 1). Pending "
+        "(unmarked) lectures do not affect it yet.\n"
+        "- 'scheduled' counts lectures planned on non-holiday dates only; holiday "
+        "days are already excluded and never penalise the user.\n"
+        "- For bunk questions ('can I skip X tomorrow and stay above 75%?') use "
+        "tomorrow's entries from the snapshot and show the arithmetic briefly: "
+        "new_percentage = 100 * present / (present + absent + skipped).\n"
+        "- For schedule questions read today's/tomorrow's entries from the snapshot; "
+        "if a day is a holiday or has no entries, say so.\n"
+        "- Be friendly and concise (2-5 sentences; short lists when helpful) and "
+        "reply in the user's language.\n"
+        "- Only attendance/schedule topics — politely decline anything else."
+    )
+
+
+def _open_chat_stream(messages: list[dict]) -> Iterator[str]:
+    """Open the Groq stream. Raises HTTPException on auth/config problems.
+
+    Kept as a module-level seam so tests can substitute a fake stream.
+    """
+    client = _groq_client()
+    try:
+        stream = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            stream=True,
+            temperature=0.6,
+            max_completion_tokens=1024,
+            reasoning_effort="low",
+            stop=None,
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Groq call failed: {exc}")
 
-    try:
-        schedule = _normalize_schedule(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"AI returned unusable JSON: {exc}")
+    def gen() -> Iterator[str]:
+        for chunk in stream:
+            if not chunk.choices:  # skip trailing usage-only chunks
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
 
-    saved = _run_db(lambda: db.replace_schedule(schedule))
-    return {
-        "schedule": saved,
-        "model_output": raw,
-        "extracted_text": text,
-        "source": source,
-    }
+    return gen()
 
 
 # --------------------------------------------------------------------------
@@ -200,155 +410,188 @@ def _analyze_and_save(text: str, source: str) -> dict:
 
 @app.get("/api/health")
 def health():
-    groq_ok = analyze_daily_schedule is not None and bool(
-        os.getenv("GROQ_API_KEY", "").strip()
-    )
+    groq_ok = Groq is not None and bool(os.getenv("GROQ_API_KEY", "").strip())
     return {
         "status": "ok",
         "groq": groq_ok,
         "groq_error": GROQ_IMPORT_ERROR,
-        "groq_model": "qwen/qwen3.8-27b",
+        "groq_model": CHAT_MODEL,
+        "groq_purpose": "attendance chatbot",
         "supabase": bool(os.getenv("SUPABASE_URL", "").strip()),
-        "client_ocr": "tesseract.js",  # OCR runs in the browser now
+        "mode": "manual-schedule",
     }
 
 
 # --------------------------------------------------------------------------
-# Schedule (text only — images are OCR'd client-side by Tesseract.js)
+# Subjects
+# --------------------------------------------------------------------------
+
+@app.get("/api/subjects")
+def list_subjects():
+    return {"subjects": _run_db(db.get_subjects)}
+
+
+@app.post("/api/subjects")
+def add_subject(body: SubjectIn):
+    name = " ".join(body.name.split())
+    if not name:
+        raise HTTPException(status_code=422, detail="Subject name is empty")
+    existing = _run_db(db.get_subjects)
+    if any(s["name"].casefold() == name.casefold() for s in existing):
+        raise HTTPException(status_code=409, detail=f"Subject '{name}' already exists")
+    try:
+        subject = _run_db(lambda: db.insert_subject(name))
+    except Exception as exc:
+        if "duplicate" in str(exc).lower() or "23505" in str(exc):
+            raise HTTPException(status_code=409, detail=f"Subject '{name}' already exists")
+        raise
+    return {"ok": True, "subject": subject}
+
+
+@app.delete("/api/subjects/{subject_id}")
+def remove_subject(subject_id: int):
+    # explicit existence check first — PostgREST deletes are not relied upon
+    # to return the removed rows (varies by client configuration)
+    exists = any(s["id"] == subject_id for s in _run_db(db.get_subjects))
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"No subject with id {subject_id}")
+    _run_db(lambda: db.delete_subject(subject_id))
+    return {"ok": True}
+
+
+@app.post("/api/subjects/seed")
+def seed_subjects():
+    """Idempotently insert the default Semester-1 subject list."""
+    return {"subjects": _run_db(lambda: db.seed_subjects(DEFAULT_SUBJECTS))}
+
+
+# --------------------------------------------------------------------------
+# Daily schedule (manual setup)
 # --------------------------------------------------------------------------
 
 @app.get("/api/schedule")
-def get_schedule():
-    return {"schedule": _run_db(db.get_schedule)}
+def get_day_schedule(date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    return _day_schedule_payload(_parse_date(date).isoformat())
 
 
-@app.post("/api/schedule/text")
-def schedule_from_text(body: TextIn):
-    """Receive text extracted in the browser and send it to Groq."""
-    return _analyze_and_save(body.schedule_text.strip(), source="text")
+@app.post("/api/schedule")
+def set_day_schedule(body: ScheduleIn):
+    d = _parse_date(body.date)
+    iso = d.isoformat()
+
+    known = {s["id"] for s in _run_db(db.get_subjects)}
+    merged: dict[int, int] = {}
+    for e in body.entries:
+        if e.subject_id not in known:
+            raise HTTPException(status_code=422, detail=f"Unknown subject_id {e.subject_id}")
+        if e.lecture_count > 0:
+            merged[e.subject_id] = merged.get(e.subject_id, 0) + e.lecture_count
+    entries = [
+        {"subject_id": sid, "lecture_count": min(cnt, 50)}
+        for sid, cnt in merged.items()
+        if cnt > 0
+    ]
+
+    _run_db(lambda: db.replace_schedule_for_date(iso, entries))
+    return _day_schedule_payload(iso)
+
+
+@app.get("/api/week")
+def get_week(start: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    d = _parse_date(start)
+    monday = _monday(d)  # snap any date back to its Monday
+    return _build_week(monday)
 
 
 # --------------------------------------------------------------------------
-# Today (day-by-day dashboard)
-# --------------------------------------------------------------------------
-
-@app.get("/api/today")
-def today(date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
-    return _today_payload(_parse_date(date))
-
-
-# --------------------------------------------------------------------------
-# Attendance log
+# Attendance (counts per scheduled class)
 # --------------------------------------------------------------------------
 
 @app.post("/api/attendance")
 def mark_attendance(body: AttendanceIn):
     d = _parse_date(body.date)
-    if _run_db(lambda: db.get_holiday(d.isoformat())):
-        raise HTTPException(status_code=409, detail=f"{d.isoformat()} is a holiday — nothing to mark")
-    record = _run_db(lambda: db.upsert_record(d.isoformat(), body.subject_name.strip(), body.status))
-    return {"ok": True, "record": record}
+    iso = d.isoformat()
+
+    if _run_db(lambda: db.get_holiday(iso)):
+        raise HTTPException(status_code=409, detail=f"{iso} is a holiday — nothing to mark")
+
+    sched_rows = _run_db(lambda: db.get_schedule_rows_for_date(iso))
+    sched = next((int(r["lecture_count"]) for r in sched_rows
+                  if r["subject_id"] == body.subject_id), None)
+    if sched is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No classes are scheduled for that subject on this date — "
+                   "set the day's lectures in Manage Semester first.",
+        )
+
+    total = body.present_count + body.absent_count
+    if total > sched:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Only {sched} lecture(s) scheduled that day — you tried to mark {total}.",
+        )
+
+    record = _run_db(
+        lambda: db.upsert_attendance(iso, body.subject_id,
+                                     body.present_count, body.absent_count)
+    )
+    return {"ok": True, "record": record, "scheduled": sched}
 
 
 @app.delete("/api/attendance")
 def unmark_attendance(
     date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    subject_name: str = Query(..., min_length=1),
+    subject_id: int = Query(..., ge=1),
 ):
-    _run_db(lambda: db.delete_record(date, subject_name))
+    _run_db(lambda: db.delete_attendance(date, subject_id))
     return {"ok": True}
 
 
 # --------------------------------------------------------------------------
-# Holidays
+# Holidays (clear a day — never penalised)
 # --------------------------------------------------------------------------
 
 @app.post("/api/holiday")
 def mark_holiday(body: HolidayIn):
     d = _parse_date(body.date)
     iso = d.isoformat()
-    _run_db(lambda: db.set_holiday(iso, body.reason.strip() or "Holiday"))
-    _run_db(lambda: db.clear_records_for_date(iso))  # never penalise a holiday
-    return _today_payload(d)
+    holiday = _run_db(lambda: db.set_holiday(iso, body.reason.strip() or "Holiday"))
+    _run_db(lambda: db.clear_attendance_for_date(iso))  # never penalise a holiday
+    return {"ok": True, "holiday": holiday}
 
 
 @app.delete("/api/holidays/{day}")
 def unmark_holiday(day: str):
     d = _parse_date(day)
     _run_db(lambda: db.remove_holiday(d.isoformat()))
-    return _today_payload(d)
+    # attendance already cleared when the holiday was set — re-mark if needed
+    return {"ok": True, "date": d.isoformat()}
 
 
 # --------------------------------------------------------------------------
-# Weekly analytics (historical)
+# Stats (Dashboard + Subject-wise tabs, chatbot snapshot)
 # --------------------------------------------------------------------------
 
-@app.get("/api/analytics")
-def analytics(
-    weeks: int = Query(8, ge=1, le=52),
-    end_date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-):
-    end = _parse_date(end_date)
-    end_monday = end.fromordinal(end.toordinal() - end.weekday())  # Monday of end week
-    start = end_monday.fromordinal(end_monday.toordinal() - 7 * (weeks - 1))
-    start_iso, end_iso = start.isoformat(), end.isoformat()
+@app.get("/api/stats")
+def stats(date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    return _build_stats(_parse_date(date).isoformat())
 
-    logs = _run_db(lambda: db.get_logs_between(start_iso, end_iso))
-    holidays = {h["date"]: h["reason"] for h in _run_db(lambda: db.get_holidays_between(start_iso, end_iso))}
 
-    by_date: dict[str, list[dict]] = {}
-    for row in logs:
-        by_date.setdefault(row["date"], []).append(row)
+# --------------------------------------------------------------------------
+# Chatbot — stats injected into the system prompt, reply streamed back
+# --------------------------------------------------------------------------
 
-    week_blocks = []
-    overall_p = overall_a = 0
-
-    for w in range(weeks):
-        week_start = date.fromordinal(start.toordinal() + 7 * w)
-        days = []
-        wk_p = wk_a = 0
-        for i, day_name in enumerate(DAYS):
-            d = date.fromordinal(week_start.toordinal() + i)
-            iso = d.isoformat()
-            records = by_date.get(iso, [])
-            p = sum(1 for r in records if r["status"] == "present")
-            a = sum(1 for r in records if r["status"] == "absent")
-            wk_p += p
-            wk_a += a
-            days.append({
-                "date": iso,
-                "day_of_week": day_name,
-                "present": p,
-                "absent": a,
-                "percent": round(100.0 * p / (p + a), 1) if (p + a) else None,
-                "holiday_reason": holidays.get(iso),
-                "future": d > end,
-                "has_classes": (p + a) > 0,
-            })
-        overall_p += wk_p
-        overall_a += wk_a
-        week_blocks.append({
-            "week_start": week_start.isoformat(),
-            "week_end": date.fromordinal(week_start.toordinal() + 6).isoformat(),
-            "label": f"{week_start.strftime('%d %b')} – {date.fromordinal(week_start.toordinal() + 6).strftime('%d %b %Y')}",
-            "present": wk_p,
-            "absent": wk_a,
-            "percent": round(100.0 * wk_p / (wk_p + wk_a), 1) if (wk_p + wk_a) else None,
-            "days": days,
-        })
-
-    return {
-        "range": {"start": start_iso, "end": end_iso, "weeks": weeks},
-        "overall": {
-            "present": overall_p,
-            "absent": overall_a,
-            "percent": round(100.0 * overall_p / (overall_p + overall_a), 1)
-            if (overall_p + overall_a) else None,
-            "holidays": len(holidays),
-            "logged_classes": overall_p + overall_a,
-        },
-        "weeks": week_blocks,
-    }
+@app.post("/api/chat")
+def chat(body: ChatIn):
+    today = body.date or datetime.utcnow().date().isoformat()
+    stats_payload = _build_stats(today)
+    messages = [
+        {"role": "system", "content": _chat_system_prompt(stats_payload)},
+        {"role": "user", "content": body.message.strip()},
+    ]
+    stream = _open_chat_stream(messages)
+    return StreamingResponse(stream, media_type="text/plain; charset=utf-8")
 
 
 # --------------------------------------------------------------------------

@@ -1,114 +1,138 @@
 # 📅 Attendance Portal — Vercel Single-Repo Deployment
 
-Day-by-day historical attendance tracking: **FastAPI + Groq (`qwen/qwen3.8-27b`) +
-Supabase**, deployed as **one repository on Vercel** — static frontend at the root,
-backend as a Python serverless function under `/api/*`.
+Day-by-day attendance tracking built around **manual daily setup** and an **AI
+attendance chatbot**: FastAPI + Groq + Supabase, deployed as **one repository
+on Vercel** — static frontend at the root, backend as a Python serverless
+function under `/api/*`.
 
-**OCR runs in your browser** with [Tesseract.js](https://github.com/naptha/tesseract.js)
-(the image never leaves your device); only the extracted *text* is sent to the backend.
+> **No OCR, no image parsing, no timetable AI.** You tell the portal how many
+> lectures of each subject happen on a date; you mark each scheduled class
+> Present/Absent; Groq powers only the floating **Attendance Chatbot**, which
+> receives your live stats and streams answers ("Can I bunk C Programming
+> tomorrow and stay above 75%?").
+
+## How the data flows
 
 ```
-attendance-portal/                ← Vercel project root
-├── index.html                    # frontend (Tesseract.js CDN loaded in <head>)
-├── app.js                        # browser OCR → POST /api/schedule/text
-├── styles.css
-├── vercel.json                   # /api rewrites + functions.maxDuration
-├── api/                          # ← Vercel serverless functions
-│   ├── index.py                  # FastAPI app — exports `app` (text-only intake)
-│   ├── groq_analyzer.py          # exact Groq streaming config (qwen/qwen3.8-27b)
-│   ├── db.py                     # supabase client
-│   └── requirements.txt          # fastapi, uvicorn, groq, supabase, python-dotenv
-├── database/schema.sql           # run once in Supabase SQL Editor
-├── smoke_test.py                 # 38-check self-test
-├── .env / .env.example           # secrets (git-ignored)
+subjects (seeded ×12)
+   └─ daily_schedule  (date, subject_id, lecture_count)   ← Manage Semester tab
+        └─ attendance_log (date, subject_id, present_count, absent_count)
+             └─ stats: % = present / (present + absent)   ← Dashboard / Subject Stats
+                  └─ /api/chat: stats snapshot → Groq → streamed reply
+holidays (date, reason) clear a day — excluded from "scheduled", never penalise
+```
+
+## Setup
+
+1. **Database** — Supabase → SQL Editor → New query → paste
+   `database/schema.sql` → **Run**. It creates the four tables, enables RLS
+   with permissive policies (the backend uses your publishable key), and
+   seeds your **12 Semester-1 subjects**. Your v2 (OCR-era) attendance rows
+   are preserved as `attendance_log_v2_backup`.
+2. **Environment** — on Vercel → Settings → Environment Variables add:
+   `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`.
+   (Locally: copy `.env.example` → `.env` — the `.env` file is git-ignored and
+   never deployed.)
+3. **Deploy** — push the repo to Vercel. `vercel.json` rewrites both
+   `/api/(.*)` and `/api` to `api/index.py` with `maxDuration: 60`.
+4. **Local dev (optional):**
+   ```bash
+   pip install -r api/requirements.txt
+   uvicorn api.index:app --port 8000
+   python3 smoke_test.py
+   ```
+
+## Project structure
+
+```
+├── index.html                    # 4 tabs + floating chatbot widget
+├── app.js                        # dashboard / stats / setup / week marking / chat streaming
+├── styles.css                    # full UI (cards, tables, week grid, chat panel)
+├── vercel.json                   # /api rewrites + functions.maxDuration 60
+├── api/
+│   ├── index.py                  # FastAPI app — exports `app` (routes + chatbot)
+│   ├── db.py                     # supabase client row layer + default subjects
+│   └── requirements.txt          # fastapi, supabase, groq (+ uvicorn, python-dotenv)
+├── database/schema.sql           # tables + RLS + seed of 12 subjects — run once
+├── smoke_test.py                 # self-test (in-memory PostgREST fake, no DB needed)
+├── .env.example                  # template only — real keys live in Vercel env vars
 └── README.md
 ```
 
-> No Docker, no Tesseract binary, no OCR API keys — the browser does the scanning.
+## The four tabs + chatbot
 
----
+| Tab | What it does |
+|---|---|
+| 📊 **Dashboard** | Total lectures scheduled, total present, total absent, overall attendance % (with meter). |
+| 📚 **Subject Stats** | Table of every subject: total lectures, present, absent, percentage (≥75% green, ≥60% amber, below red). |
+| 🛠️ **Manage Semester** | Add / delete subjects (delete cascades), restore the default 12, and a **date picker** where you enter lecture counts per subject (e.g. C Programming: 3, Front-End: 1). Saving replaces that day's scheduled totals. |
+| ✅ **Mark Attendance** | Week-by-week grid (Mon→Sun, prev/next navigation). Each scheduled class is a chip: tap cycles **pending → Present → Absent → pending**. Per-day **🌴 Mark Holiday** (with optional reason) clears the day so nothing is penalised; ↩ Undo restores the schedule view. |
+| 💬 **Chatbot** | Floating button → chat panel. `POST /api/chat` builds a JSON snapshot of your live stats server-side, injects it into the system prompt, and **streams** Groq's reply chunk-by-chunk. |
 
-## 1. One-time setup
+## Stats math
 
-### a) Supabase tables
-Supabase Dashboard → **SQL Editor** → paste `database/schema.sql` → **Run**
-(creates `weekly_schedule`, `attendance_log`, `holidays` + RLS policies).
+- `percentage = 100 × present / (present + absent)` — pending (unmarked)
+  lectures don't count against you until marked.
+- `scheduled` counts only lectures on **non-holiday** dates.
+- Marking a holiday deletes that date's attendance rows (no penalty) but
+  keeps the schedule rows; stats simply exclude holiday dates.
 
-### b) Environment — `.env` (local) / Vercel → Settings → Environment Variables
-
-```ini
-GROQ_API_KEY=gsk_…                                  # console.groq.com → API Keys
-SUPABASE_URL=https://<ref>.supabase.co              # Project Settings → API
-SUPABASE_KEY=sb_publishable_…                        # publishable or service key
-```
-
----
-
-## 2. Run locally
-
-```bash
-pip install -r api/requirements.txt
-
-# full app (frontend + /api proxy, exactly like production):
-npm i -g vercel && vercel dev            # → http://localhost:3000
-
-# or API only:
-uvicorn api.index:app --reload           # → http://localhost:8000/docs
-```
-
-Self-test: `python smoke_test.py`
-
----
-
-## 3. Deploy to Vercel (single repo)
-
-1. **Push to GitHub** (`git add -A && git commit && git push`).
-2. **Import** at <https://vercel.com/new> → repo → preset **Other**
-   (`vercel.json` already contains the `/api` → `api/index.py` rewrites and
-   `"maxDuration": 60`; static files are served automatically).
-3. **Environment variables**: `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`.
-4. **Deploy** → open `https://<project>.vercel.app`.
-
----
-
-## 4. How it works
-
-| Piece | File | Notes |
-|---|---|---|
-| Browser OCR | `index.html` + `app.js` | Tesseract.js v5 from jsDelivr; multi-pass page-segmentation (default → psm 4 → 6 → 11) with live "Scanning image on your device…" progress; **image is never uploaded** |
-| Frontend | `index.html`, `app.js`, `styles.css` | served by Vercel's CDN; all fetches use relative `/api/...` paths |
-| Serverless function | `api/index.py` | exports `app = FastAPI(...)`; text-only intake (`/api/schedule/text`); no StaticFiles mount |
-| AI | `api/groq_analyzer.py` | playground config: `qwen/qwen3.8-27b`, `temperature=0.6`, `max_completion_tokens=2048`, `top_p=0.95`, `reasoning_effort="default"`, `stream=True`, `stop=None` |
-| Database | `api/db.py` | supabase-py → `weekly_schedule` / `attendance_log` / `holidays` |
-
-**Schedule extraction flow:** choose image → browser OCR (Tesseract.js) →
-`POST /api/schedule/text` with the extracted text → Groq structures it into
-`{Monday: [...], …}` → `weekly_schedule` replaced in Supabase.
-
-**API reference**
+## API reference
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | groq / supabase status (`client_ocr: "tesseract.js"`) |
-| `GET` / `POST` | `/api/schedule`, `/api/schedule/text` | read / save the parsed timetable |
-| `GET` | `/api/today?date=` | weekday filter + marks + holiday |
-| `POST` / `DELETE` | `/api/attendance` | log / remove a `(date, subject, status)` row |
-| `POST` / `DELETE` | `/api/holiday`, `/api/holidays/{date}` | mark / undo holiday |
-| `GET` | `/api/analytics?weeks=` | week-by-week percentages |
+| GET | `/api/health` | groq / supabase / `groq_model` / `mode: manual-schedule` |
+| GET | `/api/subjects` | list subjects |
+| POST | `/api/subjects` | add `{name}` (409 on duplicate) |
+| DELETE | `/api/subjects/{id}` | delete subject + its schedule + attendance |
+| POST | `/api/subjects/seed` | idempotently restore the default 12 |
+| GET | `/api/schedule?date=` | one day's lecture counts (all subjects) |
+| POST | `/api/schedule` | **replace** a day `{date, entries:[{subject_id, lecture_count}]}` |
+| GET | `/api/week?start=` | full week payload for the Mark Attendance tab (snaps to Monday) |
+| POST | `/api/attendance` | `{date, subject_id, present_count, absent_count}` — validated against the scheduled count; 409 on holidays/unscheduled |
+| DELETE | `/api/attendance?date=&subject_id=` | clear one subject's marks for a day |
+| POST | `/api/holiday` | `{date, reason?}` — mark holiday + clear the day's marks |
+| DELETE | `/api/holidays/{date}` | undo a holiday |
+| GET | `/api/stats?date=` | dashboard + subject-wise totals + today/tomorrow blocks |
+| POST | `/api/chat` | `{message, date?}` → **streams** plain-text reply |
+| GET | `/` · `/api` | health / rewrite connectivity checks |
 
----
+## The chatbot
 
-## 5. Troubleshooting
+- Model: **`openai/gpt-oss-20b`** (Groq). Your suggested `llama3-8b-8192`
+  was shut down in Aug 2025 and its successor `llama-3.1-8b-instant` was
+  shut down in Aug 2026 — Groq's official fast replacement for that class
+  is `openai/gpt-oss-20b`.
+- The route reads the DB first (overall + per-subject + today/tomorrow),
+  serialises it into the system prompt, then calls
+  `client.chat.completions.create(..., stream=True)` and yields
+  `chunk.choices[0].delta.content` as it arrives (usage-only chunks skipped).
+- Frontend reads the body with `ReadableStream` and paints tokens as they
+  land; errors surface as a red bubble (502 `Groq call failed: …`).
 
-- **"Tesseract.js failed to load"** → the jsDelivr CDN was unreachable in the
-  browser; retry or swap the `<script>` URL for unpkg: `https://unpkg.com/tesseract.js@5/dist/tesseract.min.js`.
-- **Scan returns "No readable text"** → the multi-pass OCR found nothing;
-  use a brighter/clearer photo, or the *paste text instead* fallback.
-- **First scan is slow** → Tesseract.js downloads its WASM core + English
-  language data (a few MB) on first use, then it's cached by the browser.
-- **"Groq call failed: 401 Invalid API Key"** → your `GROQ_API_KEY` was revoked
-  or rotated — paste the fresh key into `.env` / Vercel env vars.
-- **503 "Supabase tables not found"** → run `database/schema.sql`.
-- **Function timeout** → `maxDuration: 60` is already set in `vercel.json`.
-- **Retired components** → `api/ocr.py`, OCR.space keys, `requests`,
-  `python-multipart` and the `/api/schedule/upload` route are all removed.
+## Smoke test
+
+```bash
+python3 smoke_test.py
+```
+Runs the real FastAPI app against an **in-memory fake of the Supabase
+PostgREST API** (no database, no network needed) with the Groq stream
+stubbed — validates routes, validation errors, schedule replacement,
+attendance limits, holiday clearing, stats math, and the chat streaming path.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| 503 `Supabase tables not found — run database/schema.sql` | Run `database/schema.sql` in the Supabase SQL Editor (and `POST /api/subjects/seed` if subjects are empty). |
+| 502 `Groq call failed: … 401 Invalid API Key` | Rotate the key at console.groq.com and update `GROQ_API_KEY` in Vercel env vars. |
+| Chat says 503 `GROQ_API_KEY missing` | Same as above — the env var isn't set in Vercel. |
+| `/api/*` returns the HTML page | `vercel.json` must contain both rewrites (`/api/(.*)` and `/api` → `/api/index.py`). Never add `builds`/`routes`. |
+| Want the old data? | v2 history lives in `attendance_log_v2_backup` (old shape: `date, subject_name, status`). The unused `weekly_schedule` table is still there too — drop them manually when done. |
+
+### Retired components (do not reintroduce)
+
+OCR.space API · Tesseract.js browser OCR · `api/groq_analyzer.py` (AI
+timetable extraction) · `POST /api/schedule/text` · `POST /api/schedule/upload`
+· `/api/today` · `/api/analytics` · `OCR_SPACE_API_KEY` · `requests` /
+`python-multipart` dependencies · `weekly_schedule` flow.

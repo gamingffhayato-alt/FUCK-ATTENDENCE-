@@ -1,18 +1,20 @@
 """
-Supabase data layer — historical, day-by-day storage.
+Supabase data layer — v3 manual daily schedule.
 
 Tables (see database/schema.sql):
-    weekly_schedule (day_of_week, subject_name, position)
-    attendance_log  (date, subject_name, status)
+    subjects        (id, name, created_at)
+    daily_schedule  (date, subject_id, lecture_count)
+    attendance_log  (date, subject_id, present_count, absent_count)
     holidays        (date, reason)
 
-All calls use the official `supabase` Python client.
+This module only fetches/writes ROWS; all aggregation (stats,
+week payloads) lives in index.py. All calls use the official
+`supabase` Python client.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date as _date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,14 +26,27 @@ for _env in (_here / ".env", _here.parent / ".env"):
     if _env.is_file():
         load_dotenv(_env)
 
-DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+# Semester 1 — mirrored in database/schema.sql (seed is idempotent).
+DEFAULT_SUBJECTS = [
+    "Basics Of Computer and C Programming",
+    "Basics Of Computer and C Programming Lab",
+    "Front-End Web Development",
+    "Front-End Web Development Lab",
+    "Environmental Studies - I",
+    "Communication & Professional Skills I",
+    "Mini Project-I",
+    "Fundamentals Of Intelligent & Autonomous Systems",
+    "Technical Training - Advance Programming In C",
+    "Computational & Quantum Physics",
+    "Computational & Quantum Physics Lab",
+    "Computational Mathematics For Intelligent Systems",
+]
+
+_client = None
 
 
 class TablesMissingError(RuntimeError):
     """The Supabase tables have not been created yet."""
-
-
-_client = None
 
 
 def sb():
@@ -41,7 +56,7 @@ def sb():
         url = os.getenv("SUPABASE_URL", "").strip()
         key = os.getenv("SUPABASE_KEY", "").strip()
         if not url or not key:
-            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing — fill in backend/.env")
+            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing — add them to .env (locally) and Vercel env vars.")
         _client = create_client(url, key)
     return _client
 
@@ -67,70 +82,74 @@ def _run(fn):
 
 
 # ---------------------------------------------------------------
-# weekly_schedule
+# subjects
 # ---------------------------------------------------------------
 
-def get_schedule() -> dict[str, list[str]]:
+def get_subjects() -> list[dict]:
     def _q():
         return (
             sb()
-            .table("weekly_schedule")
-            .select("day_of_week, subject_name, position")
-            .order("position")
+            .table("subjects")
+            .select("id, name, created_at")
+            .order("name")
             .execute()
             .data
         )
 
-    schedule = {d: [] for d in DAYS}
-    for row in _run(_q):
-        day = row.get("day_of_week")
-        if day in schedule and row["subject_name"] not in schedule[day]:
-            schedule[day].append(row["subject_name"])
-    return schedule
+    return _run(_q)
 
 
-def replace_schedule(schedule: dict[str, list[str]]) -> dict[str, list[str]]:
-    """The uploaded timetable replaces whatever was stored before."""
-
+def insert_subject(name: str) -> dict:
     def _q():
-        c = sb()
-        c.table("weekly_schedule").delete().gte("id", 0).execute()
-        rows = []
-        canonical: dict[str, str] = {}  # casefold -> first-seen spelling
-        for day in DAYS:
-            seen: set[str] = set()
-            position = 0
-            for subject in schedule.get(day, []):
-                key = subject.casefold()
-                if key in canonical:
-                    subject = canonical[key]  # unify OCR variants like "EvS"/"EVS"
-                else:
-                    canonical[key] = subject
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(
-                    {"day_of_week": day, "subject_name": subject, "position": position}
-                )
-                position += 1
-        if rows:
-            c.table("weekly_schedule").insert(rows).execute()
-        return True
+        rows = sb().table("subjects").insert({"name": name}).execute().data
+        return rows[0] if rows else {"name": name}
 
-    _run(_q)
-    return get_schedule()
+    return _run(_q)
 
 
-# ---------------------------------------------------------------
-# attendance_log
-# ---------------------------------------------------------------
+def delete_subject(subject_id: int) -> list[dict]:
+    """FK `on delete cascade` also removes this subject's schedule + attendance."""
 
-def get_records_for_date(iso_date: str) -> list[dict]:
     def _q():
         return (
             sb()
-            .table("attendance_log")
-            .select("date, subject_name, status")
+            .table("subjects")
+            .delete()
+            .eq("id", subject_id)
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def seed_subjects(names: list[str]) -> list[dict]:
+    """Insert any of `names` that do not exist yet (case-insensitive)."""
+
+    def _q():
+        c = sb()
+        existing = {
+            s["name"].casefold()
+            for s in c.table("subjects").select("name").execute().data
+        }
+        new_rows = [{"name": n} for n in names if n.casefold() not in existing]
+        if new_rows:
+            c.table("subjects").insert(new_rows).execute()
+        return c.table("subjects").select("id, name, created_at").order("name").execute().data
+
+    return _run(_q)
+
+
+# ---------------------------------------------------------------
+# daily_schedule
+# ---------------------------------------------------------------
+
+def get_schedule_rows_for_date(iso_date: str) -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("daily_schedule")
+            .select("date, subject_id, lecture_count")
             .eq("date", iso_date)
             .execute()
             .data
@@ -139,31 +158,148 @@ def get_records_for_date(iso_date: str) -> list[dict]:
     return _run(_q)
 
 
-def upsert_record(iso_date: str, subject_name: str, status: str) -> dict:
+def get_schedule_rows_between(start_iso: str, end_iso: str) -> list[dict]:
     def _q():
         return (
             sb()
-            .table("attendance_log")
-            .upsert(
-                {"date": iso_date, "subject_name": subject_name, "status": status},
-                on_conflict="date,subject_name",
-            )
+            .table("daily_schedule")
+            .select("date, subject_id, lecture_count")
+            .gte("date", start_iso)
+            .lte("date", end_iso)
             .execute()
             .data
         )
 
-    rows = _run(_q)
-    return rows[0] if rows else {"date": iso_date, "subject_name": subject_name, "status": status}
+    return _run(_q)
 
 
-def delete_record(iso_date: str, subject_name: str) -> bool:
+def get_all_schedule_rows() -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("daily_schedule")
+            .select("date, subject_id, lecture_count")
+            .order("date")
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def replace_schedule_for_date(iso_date: str, entries: list[dict]) -> list[dict]:
+    """Replace the whole day: delete rows for the date, insert non-zero counts."""
+
+    def _q():
+        c = sb()
+        c.table("daily_schedule").delete().eq("date", iso_date).execute()
+        rows = [
+            {
+                "date": iso_date,
+                "subject_id": int(e["subject_id"]),
+                "lecture_count": int(e["lecture_count"]),
+            }
+            for e in entries
+            if int(e.get("lecture_count", 0)) > 0
+        ]
+        if rows:
+            c.table("daily_schedule").insert(rows).execute()
+        return rows
+
+    return _run(_q)
+
+
+# ---------------------------------------------------------------
+# attendance_log (counts)
+# ---------------------------------------------------------------
+
+def get_attendance_rows_for_date(iso_date: str) -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("attendance_log")
+            .select("date, subject_id, present_count, absent_count")
+            .eq("date", iso_date)
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def get_attendance_rows_between(start_iso: str, end_iso: str) -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("attendance_log")
+            .select("date, subject_id, present_count, absent_count")
+            .gte("date", start_iso)
+            .lte("date", end_iso)
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def get_all_attendance_rows() -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("attendance_log")
+            .select("date, subject_id, present_count, absent_count")
+            .order("date")
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def upsert_attendance(iso_date: str, subject_id: int, present: int, absent: int) -> dict:
+    """0/0 removes the row entirely (unmarked)."""
+
+    def _q():
+        c = sb()
+        if present <= 0 and absent <= 0:
+            (
+                c.table("attendance_log")
+                .delete()
+                .eq("date", iso_date)
+                .eq("subject_id", subject_id)
+                .execute()
+            )
+            return {
+                "date": iso_date,
+                "subject_id": subject_id,
+                "present_count": 0,
+                "absent_count": 0,
+            }
+        row = {
+            "date": iso_date,
+            "subject_id": subject_id,
+            "present_count": present,
+            "absent_count": absent,
+        }
+        rows = (
+            c.table("attendance_log")
+            .upsert(row, on_conflict="date,subject_id")
+            .execute()
+            .data
+        )
+        return rows[0] if rows else row
+
+    return _run(_q)
+
+
+def delete_attendance(iso_date: str, subject_id: int) -> bool:
     def _q():
         (
             sb()
             .table("attendance_log")
             .delete()
             .eq("date", iso_date)
-            .eq("subject_name", subject_name)
+            .eq("subject_id", subject_id)
             .execute()
         )
         return True
@@ -171,27 +307,12 @@ def delete_record(iso_date: str, subject_name: str) -> bool:
     return _run(_q)
 
 
-def clear_records_for_date(iso_date: str) -> bool:
+def clear_attendance_for_date(iso_date: str) -> bool:
     """Called when a day is marked as a holiday — nothing may be penalised."""
 
     def _q():
         sb().table("attendance_log").delete().eq("date", iso_date).execute()
         return True
-
-    return _run(_q)
-
-
-def get_logs_between(start_iso: str, end_iso: str) -> list[dict]:
-    def _q():
-        return (
-            sb()
-            .table("attendance_log")
-            .select("date, subject_name, status")
-            .gte("date", start_iso)
-            .lte("date", end_iso)
-            .execute()
-            .data
-        )
 
     return _run(_q)
 
@@ -218,7 +339,7 @@ def get_holiday(iso_date: str) -> dict | None:
 
 def set_holiday(iso_date: str, reason: str) -> dict:
     def _q():
-        return (
+        rows = (
             sb()
             .table("holidays")
             .upsert({"date": iso_date, "reason": reason or "Holiday"},
@@ -226,9 +347,9 @@ def set_holiday(iso_date: str, reason: str) -> dict:
             .execute()
             .data
         )
+        return rows[0] if rows else {"date": iso_date, "reason": reason}
 
-    rows = _run(_q)
-    return rows[0] if rows else {"date": iso_date, "reason": reason}
+    return _run(_q)
 
 
 def remove_holiday(iso_date: str) -> bool:
@@ -247,6 +368,20 @@ def get_holidays_between(start_iso: str, end_iso: str) -> list[dict]:
             .select("date, reason")
             .gte("date", start_iso)
             .lte("date", end_iso)
+            .execute()
+            .data
+        )
+
+    return _run(_q)
+
+
+def get_all_holidays() -> list[dict]:
+    def _q():
+        return (
+            sb()
+            .table("holidays")
+            .select("date, reason")
+            .order("date")
             .execute()
             .data
         )

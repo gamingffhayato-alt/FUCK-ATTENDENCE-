@@ -4,7 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Attendance Portal — Day by Day</title>
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📅</text></svg>" />
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -14,7 +13,7 @@
       <span class="logo">📅</span>
       <div>
         <h1>Attendance Portal</h1>
-        <p class="sub">Precise day-by-day historical attendance tracking</p>
+        <p class="sub">Semester 1 · manual daily schedule · AI attendance assistant</p>
       </div>
     </div>
     <div class="top-right">
@@ -24,134 +23,189 @@
   </header>
 
   <nav class="tabs" role="tablist">
-    <button class="tab active" data-tab="today" role="tab">📌 Today</button>
-    <button class="tab" data-tab="analytics" role="tab">📊 Analytics</button>
-    <button class="tab" data-tab="schedule" role="tab">🗓️ Schedule</button>
+    <button class="tab active" data-tab="dashboard" role="tab">📊 Dashboard</button>
+    <button class="tab" data-tab="subjects" role="tab">📚 Subject Stats</button>
+    <button class="tab" data-tab="manage" role="tab">🛠️ Manage Semester</button>
+    <button class="tab" data-tab="attendance" role="tab">✅ Mark Attendance</button>
   </nav>
 
   <main>
-    <!-- ================= TODAY ================= -->
-    <section id="tab-today" class="tab-panel">
+    <!-- ================= TAB 1: DASHBOARD ================= -->
+    <section id="tab-dashboard" class="tab-panel">
       <div class="day-hero">
         <div>
-          <p class="eyebrow">Today</p>
-          <h2 id="todayDate">Loading…</h2>
+          <p class="eyebrow">Overview</p>
+          <h2>Dashboard</h2>
         </div>
-        <div id="dayTags" class="day-tags"></div>
+        <div id="dashTags" class="day-tags"></div>
       </div>
 
-      <div id="holidayBanner" class="banner holiday" hidden>
-        <span class="banner-icon">🌴</span>
-        <div class="banner-text">
-          <b id="holidayTitle">Today is a holiday</b>
-          <p id="holidayReasonText" class="muted">No classes will be penalised.</p>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <span class="stat-icon blue">🗓️</span>
+          <b id="statScheduled">—</b>
+          <span class="stat-label">Total lectures scheduled</span>
         </div>
-        <button id="undoHolidayBtn" class="btn ghost">↩ Undo holiday</button>
+        <div class="stat-card">
+          <span class="stat-icon good">✓</span>
+          <b id="statPresent">—</b>
+          <span class="stat-label">Total present</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-icon bad">✗</span>
+          <b id="statAbsent">—</b>
+          <span class="stat-label">Total absent</span>
+        </div>
+        <div class="stat-card accent">
+          <b id="statPct">—</b>
+          <span class="stat-label">Overall attendance</span>
+          <div class="meter"><i id="statMeter"></i></div>
+        </div>
       </div>
 
-      <div id="weekendBanner" class="banner weekend" hidden>
-        🗓️ <b>Weekend</b> — your timetable for this day (if any) is shown below.
-      </div>
-
-      <div id="dayClasses" class="class-list" aria-live="polite"></div>
-
-      <div id="freeDay" class="empty" hidden>
-        <div class="empty-icon">🌤️</div>
-        <p><b>Nothing scheduled for today</b></p>
-        <p class="muted">Upload your timetable in the <b>Schedule</b> tab and today's
-           classes will appear here automatically.</p>
-      </div>
-
-      <div id="holidayControls" class="holiday-controls">
-        <input id="holidayReasonInput" type="text" maxlength="200"
-               placeholder="Reason (optional) — e.g. Diwali, college function" />
-        <button id="holidayBtn" class="btn purple">🌴 Mark Today as Holiday</button>
-      </div>
-    </section>
-
-    <!-- ================= ANALYTICS ================= -->
-    <section id="tab-analytics" class="tab-panel" hidden>
-      <div class="toolbar">
-        <label class="range-label">Range
-          <select id="weeksSelect">
-            <option value="4">Last 4 weeks</option>
-            <option value="8" selected>Last 8 weeks</option>
-            <option value="12">Last 12 weeks</option>
-          </select>
-        </label>
-        <div id="anSummary" class="summary"></div>
-      </div>
-
-      <div id="weeksGrid" class="weeks-grid"></div>
-
-      <div id="anEmpty" class="empty" hidden>
-        <div class="empty-icon">📊</div>
-        <p><b>No attendance logged in this range</b></p>
-        <p class="muted">Mark Present/Absent on the Today tab to build your history.</p>
-      </div>
-    </section>
-
-    <!-- ================= SCHEDULE ================= -->
-    <section id="tab-schedule" class="tab-panel" hidden>
-      <div class="panel">
+      <div class="panel dash-hint">
         <div class="panel-head">
-          <h2>📤 Upload timetable image</h2>
-          <span class="badge subtle">Tesseract.js → Groq qwen/qwen3.8-27b</span>
+          <h2>💬 Ask your attendance assistant</h2>
+          <span class="badge subtle">Groq openai/gpt-oss-20b · streaming</span>
         </div>
         <p class="hint">
-          Upload a photo/screenshot of your weekly timetable. Your browser scans it
-          locally with <b>Tesseract.js</b> (the image never leaves your device), then
-          sends the extracted text to the Groq AI model, which structures it
-          day-by-day (Monday → Sunday) and saves it.
+          The chatbot knows your live numbers. Try:
+          <button class="link-chip" data-ask="Can I bunk C Programming tomorrow and stay above 75%?">Can I bunk C Programming tomorrow and stay above 75%?</button>
+          <button class="link-chip" data-ask="What is my overall attendance right now?">What is my overall attendance right now?</button>
         </p>
+      </div>
+    </section>
 
-        <div id="dropZone" class="dropzone" tabindex="0">
-          <input type="file" id="fileInput" accept="image/*" hidden />
-          <div id="dzIdle" class="dz-idle">
-            <span class="dz-icon">🖼️</span>
-            <p><b>Click to choose</b> or drop an image here</p>
-            <p class="muted">PNG · JPG · WEBP · BMP · TIFF — scanned in your browser, never uploaded</p>
-          </div>
-          <img id="preview" alt="Timetable preview" hidden />
-          <p id="fileName" class="muted" hidden></p>
+    <!-- ================= TAB 2: SUBJECT-WISE STATS ================= -->
+    <section id="tab-subjects" class="tab-panel" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>📚 Subject-wise attendance</h2>
+          <button id="reloadStats" class="btn ghost" type="button">↻ Refresh</button>
         </div>
-
-        <div class="row">
-          <button id="extractBtn" class="btn primary" disabled>⚡ Extract &amp; Save Schedule</button>
-          <span id="uploadStatus" class="status" role="status"></span>
+        <p class="hint">
+          Percentage = present ÷ (present + absent) of classes you have actually
+          marked. Pending lectures don't count against you until marked.
+        </p>
+        <div class="table-wrap">
+          <table class="stats-table" id="subjectsStatsTable">
+            <thead>
+              <tr>
+                <th>Subject</th>
+                <th class="num">Total lectures</th>
+                <th class="num">Present</th>
+                <th class="num">Absent</th>
+                <th class="num">Percentage</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
         </div>
+        <div id="subjEmpty" class="empty" hidden>
+          <div class="empty-icon">📚</div>
+          <p><b>No subjects yet</b></p>
+          <p class="muted">Open <b>Manage Semester</b> and hit “Restore default subjects”.</p>
+        </div>
+      </div>
+    </section>
 
-        <details class="fallback">
-          <summary>No image? Paste the text instead</summary>
-          <textarea id="scheduleText" rows="6" spellcheck="false"
-            placeholder="Monday&#10;Engineering Mathematics&#10;Physics&#10;&#10;Tuesday&#10;Engineering Mathematics&#10;Chemistry"></textarea>
-          <button id="parseTextBtn" class="btn" type="button">Parse pasted text</button>
-        </details>
-
-        <details id="ocrDetails" class="fallback" hidden>
-          <summary>Text extracted from your image</summary>
-          <pre id="ocrText" class="ocr-out"></pre>
-        </details>
+    <!-- ================= TAB 3: MANAGE SEMESTER ================= -->
+    <section id="tab-manage" class="tab-panel" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>🗂️ Subjects</h2>
+          <button id="seedSubjects" class="btn ghost" type="button">↺ Restore default 12</button>
+        </div>
+        <p class="hint">Add or remove subjects. Deleting a subject also removes its schedule and attendance.</p>
+        <form id="addSubjectForm" class="add-row">
+          <input id="subjectNameInput" type="text" maxlength="160"
+                 placeholder="New subject name — e.g. Software Engineering" required />
+          <button class="btn primary" type="submit">＋ Add subject</button>
+        </form>
+        <ul id="subjectManageList" class="subject-list"></ul>
       </div>
 
       <div class="panel">
         <div class="panel-head">
-          <h2>🗓️ Current weekly schedule</h2>
-          <button id="reloadSched" class="btn ghost" type="button">↻ Refresh</button>
+          <h2>🗓️ Daily schedule setup</h2>
+          <label class="date-field">Date
+            <input id="setupDate" type="date" />
+          </label>
         </div>
-        <div id="scheduleGrid" class="schedule-grid"></div>
-        <div id="schedEmpty" class="empty" hidden>
-          <div class="empty-icon">🗂️</div>
-          <p><b>No schedule saved yet</b></p>
-          <p class="muted">Upload a timetable image above to populate your week.</p>
+        <p class="hint">
+          Enter how many lectures happen for each subject on this date
+          (<b>0 = no classes</b>). Saving updates the day's scheduled totals —
+          then mark them on the <b>Mark Attendance</b> tab.
+        </p>
+
+        <div id="setupHolidayWarn" class="banner holiday" hidden>
+          <span class="banner-icon">🌴</span>
+          <div class="banner-text">
+            <b>This date is a holiday</b>
+            <p class="muted">Its lectures never count toward your totals until you undo the holiday.</p>
+          </div>
         </div>
+
+        <div id="setupRows" class="setup-rows"></div>
+
+        <div class="row">
+          <button id="saveSetup" class="btn primary" type="button">💾 Save day</button>
+          <button id="clearSetup" class="btn ghost" type="button">Clear day</button>
+          <span id="setupStatus" class="status" role="status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TAB 4: MARK ATTENDANCE (WEEK-BY-WEEK) ================= -->
+    <section id="tab-attendance" class="tab-panel" hidden>
+      <div class="week-toolbar">
+        <button id="prevWeek" class="btn ghost" type="button">← Previous</button>
+        <div class="week-title">
+          <b id="weekLabel">…</b>
+          <button id="thisWeek" class="btn ghost small" type="button">This week</button>
+        </div>
+        <button id="nextWeek" class="btn ghost" type="button">Next →</button>
+      </div>
+
+      <div id="weekGrid" class="week-grid"></div>
+
+      <div id="weekEmpty" class="empty" hidden>
+        <div class="empty-icon">🗓️</div>
+        <p><b>Nothing scheduled this week</b></p>
+        <p class="muted">Set lecture counts in <b>Manage Semester</b>, then come back to mark them.</p>
       </div>
     </section>
   </main>
 
   <footer class="foot">
-    FastAPI · Tesseract.js (in-browser OCR) · Groq (qwen/qwen3.8-27b) · Supabase PostgreSQL
+    FastAPI · Manual daily schedule · Groq (openai/gpt-oss-20b) chatbot · Supabase PostgreSQL
   </footer>
+
+  <!-- ================= AI CHATBOT WIDGET ================= -->
+  <button id="chatFab" class="chat-fab" type="button" aria-label="Open attendance assistant">💬</button>
+
+  <section id="chatPanel" class="chat-panel" hidden aria-label="Attendance assistant">
+    <header class="chat-head">
+      <div>
+        <b>🤖 Attendance Assistant</b>
+        <p>live stats · Groq streaming</p>
+      </div>
+      <div class="chat-head-actions">
+        <button id="chatClear" class="chip-x" type="button" title="Clear conversation">🗑</button>
+        <button id="chatClose" class="chip-x" type="button" title="Close">✕</button>
+      </div>
+    </header>
+    <div id="chatLog" class="chat-log" aria-live="polite"></div>
+    <div class="chat-quick">
+      <button class="qchip" type="button">Can I bunk tomorrow and stay above 75%?</button>
+      <button class="qchip" type="button">What's my weakest subject?</button>
+    </div>
+    <form id="chatForm" class="chat-input">
+      <textarea id="chatInput" rows="1" maxlength="2000"
+        placeholder="Ask about your attendance… (Enter to send)"></textarea>
+      <button id="chatSend" class="btn primary" type="submit">➤</button>
+    </form>
+  </section>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
   <script src="app.js"></script>
