@@ -207,7 +207,7 @@ def health():
         "status": "ok",
         "groq": groq_ok,
         "groq_error": GROQ_IMPORT_ERROR,
-        "groq_model": "openai/gpt-oss-20b",
+        "groq_model": "qwen/qwen3.8-27b",
         "supabase": bool(os.getenv("SUPABASE_URL", "").strip()),
         "client_ocr": "tesseract.js",  # OCR runs in the browser now
     }

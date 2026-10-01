@@ -1,6 +1,6 @@
 # 📅 Attendance Portal — Vercel Single-Repo Deployment
 
-Day-by-day historical attendance tracking: **FastAPI + Groq (`openai/gpt-oss-20b`) +
+Day-by-day historical attendance tracking: **FastAPI + Groq (`qwen/qwen3.8-27b`) +
 Supabase**, deployed as **one repository on Vercel** — static frontend at the root,
 backend as a Python serverless function under `/api/*`.
 
@@ -15,7 +15,7 @@ attendance-portal/                ← Vercel project root
 ├── vercel.json                   # /api rewrites + functions.maxDuration
 ├── api/                          # ← Vercel serverless functions
 │   ├── index.py                  # FastAPI app — exports `app` (text-only intake)
-│   ├── groq_analyzer.py          # exact Groq streaming config (openai/gpt-oss-20b)
+│   ├── groq_analyzer.py          # exact Groq streaming config (qwen/qwen3.8-27b)
 │   ├── db.py                     # supabase client
 │   └── requirements.txt          # fastapi, uvicorn, groq, supabase, python-dotenv
 ├── database/schema.sql           # run once in Supabase SQL Editor
@@ -78,7 +78,7 @@ Self-test: `python smoke_test.py`
 | Browser OCR | `index.html` + `app.js` | Tesseract.js v5 from jsDelivr; multi-pass page-segmentation (default → psm 4 → 6 → 11) with live "Scanning image on your device…" progress; **image is never uploaded** |
 | Frontend | `index.html`, `app.js`, `styles.css` | served by Vercel's CDN; all fetches use relative `/api/...` paths |
 | Serverless function | `api/index.py` | exports `app = FastAPI(...)`; text-only intake (`/api/schedule/text`); no StaticFiles mount |
-| AI | `api/groq_analyzer.py` | exact spec: `openai/gpt-oss-20b`, `temperature=1`, `max_completion_tokens=2048`, `top_p=1`, `reasoning_effort="medium"`, `stream=True` |
+| AI | `api/groq_analyzer.py` | playground config: `qwen/qwen3.8-27b`, `temperature=0.6`, `max_completion_tokens=2048`, `top_p=0.95`, `reasoning_effort="default"`, `stream=True`, `stop=None` |
 | Database | `api/db.py` | supabase-py → `weekly_schedule` / `attendance_log` / `holidays` |
 
 **Schedule extraction flow:** choose image → browser OCR (Tesseract.js) →
