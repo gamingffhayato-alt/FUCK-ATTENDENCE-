@@ -254,6 +254,9 @@ def main():
         check(f"schema creates {table}", f"create table if not exists public.{table}" in schema)
     check("schema seeds all 12 subjects", all(f"'{n}'" in schema for n in DEFAULTS))
     check("schema preserves v2 history (backup rename)", "attendance_log_v2_backup" in schema)
+    check("schema frees legacy index names (42P07 fix)",
+          "attendance_log_v2_backup_pkey" in schema
+          and "attendance_log_v2_backup_date_subject_unique" in schema)
 
     vc = json.loads(read("vercel.json"))
     srcs = [r.get("source") for r in vc.get("rewrites", [])]
@@ -264,6 +267,8 @@ def main():
 
     js = read("app.js")
     check("frontend calls /api/chat", '"/api/chat"' in js)
+    check("CSS honours [hidden] (chat panel actually closes)",
+          "[hidden] { display: none !important; }" in read("styles.css"))
     check("frontend has4 tabs + chat widget",
           read("index.html").count('role="tab"') == 4 and 'id="chatFab"' in read("index.html"))
     check("chat model is openai/gpt-oss-20b", 'CHAT_MODEL = "openai/gpt-oss-20b"' in read("api/index.py"))

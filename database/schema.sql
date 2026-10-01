@@ -37,8 +37,22 @@ begin
             -- a backup already exists — this old-shaped table can go
             drop table public.attendance_log cascade;
         end if;
-        -- the legacy index kept its old name across the rename
-        execute 'drop index if exists public.attendance_log_date_idx';
+    end if;
+
+    -- A renamed table keeps its INDEX names, and indexes are unique per
+    -- schema. The backup therefore still owns the legacy names the NEW
+    -- attendance_log needs (attendance_log_pkey,
+    -- attendance_log_date_subject_unique, attendance_log_date_idx).
+    -- Free them — but only while the new table does not exist yet, so a
+    -- successful re-run never touches the live table's indexes.
+    if to_regclass('public.attendance_log_v2_backup') is not null
+       and to_regclass('public.attendance_log') is null
+    then
+        alter index if exists public.attendance_log_pkey
+            rename to attendance_log_v2_backup_pkey;
+        alter index if exists public.attendance_log_date_subject_unique
+            rename to attendance_log_v2_backup_date_subject_unique;
+        drop index if exists public.attendance_log_date_idx;
     end if;
 end $$;
 

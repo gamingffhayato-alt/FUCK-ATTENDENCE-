@@ -128,6 +128,7 @@ attendance limits, holiday clearing, stats math, and the chat streaming path.
 | 502 `Groq call failed: … 401 Invalid API Key` | Rotate the key at console.groq.com and update `GROQ_API_KEY` in Vercel env vars. |
 | Chat says 503 `GROQ_API_KEY missing` | Same as above — the env var isn't set in Vercel. |
 | `/api/*` returns the HTML page | `vercel.json` must contain both rewrites (`/api/(.*)` and `/api` → `/api/index.py`). Never add `builds`/`routes`. |
+| SQL error `42P07 relation "attendance_log_date_subject_unique" already exists` | You ran an older copy of `database/schema.sql`. Pull the latest version — it renames the legacy indexes held by `attendance_log_v2_backup` (`…_pkey`, `…_date_subject_unique`) before creating the new table — and run it again. It is safe to re-run. |
 | Want the old data? | v2 history lives in `attendance_log_v2_backup` (old shape: `date, subject_name, status`). The unused `weekly_schedule` table is still there too — drop them manually when done. |
 
 ### Retired components (do not reintroduce)
