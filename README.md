@@ -73,8 +73,9 @@ Self-test (no Vercel needed): `python smoke_test.py`
    git push -u origin main
    ```
 2. **Import** at <https://vercel.com/new> → select the repo → Framework preset
-   **Other** → don't change build settings (`vercel.json` already configures
-   `@vercel/python`, routes, and static files).
+   **Other** → don't change build settings (`vercel.json` already contains the
+   `/api` → `api/index.py` rewrites and `"maxDuration": 60`; static files are
+   served automatically).
 3. **Add environment variables** (Settings → Environment Variables):
    `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `OCR_SPACE_API_KEY` — paste
    the same values from your `.env`.
@@ -115,10 +116,12 @@ Self-test (no Vercel needed): `python smoke_test.py`
 - **Upload fails with a clear503** → `OCR_SPACE_API_KEY` missing in Vercel env vars.
 - **413 / body too large** → Vercel caps request bodies ≈ 4.5 MB and OCR.space works
   best with images ≤ ~1 MB — compress screenshots before uploading.
-- **Function timeout on upload** → OCR + Groq + DB can exceed the default duration on
-  the Hobby plan; keep images small, or raise `maxDuration` for `api/index.py`
-  (Vercel Settings → Functions, or the modern `functions` key in `vercel.json`,
-  which replaces the legacy `builds` array).
+- **Function timeout on upload** → `maxDuration: 60` is already set in
+  `vercel.json` for `api/index.py`; if the Hobby plan rejects it, Vercel
+  Settings → Functions lets you adjust it.
+- **Upload fails with OCR throttle (E551 / "helloworld … throttled")** → the
+  shared test key is rate-limited — register your own free key at
+  https://ocr.space/ocrapi and update `OCR_SPACE_API_KEY`.
 - **503 "Supabase tables not found"** → run `database/schema.sql`.
 - **502 "Groq call failed"** → check `GROQ_API_KEY` and model access to `openai/gpt-oss-20b`.
 - **Old docs?** The previous Hugging Face/Docker/Tesseract setup is retired —

@@ -43,14 +43,26 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
+
+  // Vercel can serve a static file (index.html) instead of the function if a
+  // route is misconfigured — detect that instead of parsing HTML to null.
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  const isJSON = contentType.includes("application/json");
   let data = null;
-  try { data = await res.json(); } catch (_) { /* empty body */ }
+  if (isJSON) {
+    data = await res.json().catch(() => null);
+  }
+
   if (!res.ok) {
     let msg = (data && data.detail) || `Request failed (HTTP ${res.status})`;
     if (Array.isArray(msg)) {
       msg = msg.map((m) => m.msg || JSON.stringify(m)).join("; ");
     }
     throw new Error(msg);
+  }
+
+  if (data === null || !isJSON) {
+    throw new Error("Backend route returned invalid response or static file instead of JSON.");
   }
   return data;
 }
@@ -84,8 +96,11 @@ function switchTab(tab) {
 
 async function loadToday() {
   try {
-    state.today = await api(`/api/today?date=${localISO()}`);
-    renderToday();
+    const data = await api(`/api/today?date=${localISO()}`);
+    if (data) {
+      state.today = data;
+      renderToday();
+    }
   } catch (err) {
     toast(err.message, "err");
   }
@@ -301,7 +316,7 @@ $("#weeksSelect").addEventListener("change", loadAnalytics);
 async function loadSchedule() {
   try {
     const data = await api("/api/schedule");
-    state.schedule = data.schedule;
+    state.schedule = (data && data.schedule) ? data.schedule : {};
     renderScheduleGrid();
   } catch (err) {
     toast(err.message, "err");
