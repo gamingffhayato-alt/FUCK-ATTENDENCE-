@@ -9,6 +9,7 @@ const state = {
   setup: null,        // GET /api/schedule?date payload (Manage tab)
   week: null,         // GET /api/week payload
   weekStart: null,    // ISO date of the week's Monday (browser-local)
+  drafts: {},         // { [date]: { entries: {sid:{p,a}}, dirty: bool } } — local, submitted per day
   busy: false,
   chatBusy: false,
   chatWelcomed: false,
@@ -130,6 +131,8 @@ function renderDashboard() {
   $("#statMeter").className = toneOf(o.percentage);
 
   const tags = [`<span class="badge blue">${o.subjects} subjects</span>`];
+  if (o.baseline && o.baseline.total > 0)
+    tags.push(`<span class="badge blue">baseline ${o.baseline.present}/${o.baseline.total} ✓</span>`);
   if (o.pending > 0)
     tags.push(`<span class="badge warn">${o.pending} lecture${o.pending === 1 ? "" : "s"} unmarked</span>`);
   if (s.today.is_holiday)
@@ -235,6 +238,33 @@ $("#seedSubjects").addEventListener("click", async () => {
   }
 });
 
+/* ---- Admin: clear day-wise history, keep subjects baseline ---- */
+
+$("#clearHistory").addEventListener("click", async () => {
+  if (state.busy) return;
+  const ok = confirm(
+    "Delete ALL day-by-day history?\n\n" +
+    "• Every row in daily_schedule and attendance_log will be removed.\n" +
+    "• Your baseline stats on subjects (initial_total / initial_present / " +
+    "initial_absent) are RETAINED — totals stay cumulative.\n\n" +
+    "This cannot be undone.");
+  if (!ok) return;
+  state.busy = true;
+  try {
+    const res = await api("/api/history/clear", { method: "POST", body: "{}" });
+    state.drafts = {};
+    toast(`🧹 History cleared ✓ (${res.deleted.schedule_rows} schedule + ` +
+      `${res.deleted.attendance_rows} attendance rows) — baseline stats kept`, "ok");
+    loadStats();
+    if (state.setup) loadSetupDay();
+    loadWeek();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    state.busy = false;
+  }
+});
+
 /* ---------------- MANAGE: daily schedule setup ---------------- */
 
 $("#setupDate").addEventListener("change", loadSetupDay);
@@ -260,18 +290,35 @@ function renderSetupRows() {
 
   $("#setupRows").innerHTML = s.entries.map((e) => `
     <div class="setup-row">
-      <label for="cnt-${e.subject_id}">${esc(e.subject)}</label>
-      <input id="cnt-${e.subject_id}" type="number" min="0" max="20" step="1"
-             value="${e.lecture_count}" data-subject="${e.subject_id}" />
+      <label>${esc(e.subject)}</label>
+      <div class="stepper">
+        <button type="button" class="step" data-step="-1" data-subject="${e.subject_id}"
+                ${e.lecture_count <= 0 ? "disabled" : ""} aria-label="One less">−</button>
+        <span class="step-count" data-count-for="${e.subject_id}">${e.lecture_count}</span>
+        <button type="button" class="step" data-step="1" data-subject="${e.subject_id}"
+                ${e.lecture_count >= 20 ? "disabled" : ""} aria-label="One more">+</button>
+      </div>
     </div>`).join("") ||
     `<p class="muted">No subjects yet — add some above.</p>`;
 }
 
+// − / + steppers: instant local update, min 0 (max 20), step 1
+$("#setupRows").addEventListener("click", (e) => {
+  const btn = e.target.closest(".step");
+  if (!btn) return;
+  const countEl = $(`[data-count-for="${btn.dataset.subject}"]`);
+  if (!countEl) return;
+  const next = Math.max(0, Math.min(20, Number(countEl.textContent) + Number(btn.dataset.step)));
+  countEl.textContent = next;
+  countEl.previousElementSibling.disabled = next <= 0;   // −
+  countEl.nextElementSibling.disabled = next >= 20;       // +
+});
+
 function collectSetupEntries() {
-  return [...document.querySelectorAll("#setupRows input[data-subject]")]
-    .map((inp) => ({
-      subject_id: Number(inp.dataset.subject),
-      lecture_count: Math.max(0, Math.min(20, Number(inp.value) || 0)),
+  return [...document.querySelectorAll("#setupRows .step-count")]
+    .map((el) => ({
+      subject_id: Number(el.dataset.countFor),
+      lecture_count: Math.max(0, Math.min(20, Number(el.textContent) || 0)),
     }));
 }
 
@@ -346,12 +393,19 @@ async function loadWeek() {
   }
 }
 
-function buildSlots(entry) {
-  const slots = new Array(entry.lecture_count).fill(null);
-  for (let i = 0; i < entry.present && i < slots.length; i++) slots[i] = "p";
-  for (let i = entry.present; i < entry.present + entry.absent && i < slots.length; i++)
-    slots[i] = "a";
-  return slots;
+/* Local draft state: edits stay in the browser until "Submit" sends ONE
+   batch request for the whole day (no DB mutation per click). */
+function draftFor(day) {
+  const prev = state.drafts[day.date];
+  const entries = {};
+  for (const e of day.entries) {
+    const cur = (prev && prev.entries[e.subject_id]) || { p: e.present, a: e.absent };
+    const p = Math.min(Math.max(0, cur.p), e.lecture_count);
+    const a = Math.min(Math.max(0, cur.a), e.lecture_count - p);
+    entries[e.subject_id] = { p, a };
+  }
+  state.drafts[day.date] = { entries, dirty: prev ? prev.dirty : false };
+  return state.drafts[day.date];
 }
 
 function renderWeek() {
@@ -396,22 +450,35 @@ function renderWeek() {
           <button class="btn purple small" data-holiday="${d.date}">🌴 Holiday</button>
         </div>`;
     } else {
+      const draft = draftFor(d);
       const rows = d.entries.map((e) => {
-        const slots = buildSlots(e);
-        const chips = slots.map((v, i) => {
-          const letter = v === "p" ? "✓" : v === "a" ? "✗" : "·";
-          return `<button class="slot ${v || ""}" data-sid="${e.subject_id}"
-                    data-i="${i}" ${isFuture ? "disabled" : ""}
-                    title="${v === "p" ? "Present" : v === "a" ? "Absent" : "Not marked"}">${letter}</button>`;
-        }).join("");
+        const cur = draft.entries[e.subject_id];
+        const pending = e.lecture_count - cur.p - cur.a;
+        const atCap = cur.p + cur.a >= e.lecture_count;
+        const dis = isFuture ? "disabled" : "";
         return `
-          <div class="att-row ${e.pending === 0 && (e.present + e.absent) > 0 ? "done" : ""}">
+          <div class="att-row ${pending === 0 ? "done" : ""}">
             <div class="att-name">${esc(e.subject)} <span class="cnt">×${e.lecture_count}</span></div>
-            <div class="slots">${chips}</div>
-            <div class="att-meta">
-              <span class="mini p">${e.present} ✓</span>
-              <span class="mini a">${e.absent} ✗</span>
-              <button class="chip-x" data-clearrow="${e.subject_id}" title="Reset this subject's marks">✕</button>
+            <div class="pa-controls">
+              <span class="pa-tag p">✓ Present</span>
+              <div class="stepper pa p">
+                <button class="step" data-pa="p" data-step="-1" data-sid="${e.subject_id}"
+                        ${cur.p <= 0 ? "disabled" : ""} ${dis}>−</button>
+                <span class="step-count ok-text">${cur.p}</span>
+                <button class="step" data-pa="p" data-step="1" data-sid="${e.subject_id}"
+                        ${atCap ? "disabled" : ""} ${dis}>+</button>
+              </div>
+              <span class="pa-tag a">✗ Absent</span>
+              <div class="stepper pa a">
+                <button class="step" data-pa="a" data-step="-1" data-sid="${e.subject_id}"
+                        ${cur.a <= 0 ? "disabled" : ""} ${dis}>−</button>
+                <span class="step-count bad-text">${cur.a}</span>
+                <button class="step" data-pa="a" data-step="1" data-sid="${e.subject_id}"
+                        ${atCap ? "disabled" : ""} ${dis}>+</button>
+              </div>
+              ${pending > 0
+                ? `<span class="mini pend">${pending} pending</span>`
+                : `<span class="mini p">✓ all marked</span>`}
             </div>
           </div>`;
       }).join("");
@@ -421,6 +488,13 @@ function renderWeek() {
           <input type="text" maxlength="200" data-reason="${d.date}"
                  placeholder="Reason (optional)" />
           <button class="btn purple small" data-holiday="${d.date}">🌴 Holiday</button>
+        </div>
+        <div class="day-card-submit ${draft.dirty ? "dirty" : ""}">
+          ${draft.dirty
+            ? '<span class="badge warn">● unsaved changes</span>'
+            : '<span class="badge">✓ saved</span>'}
+          <button class="btn primary small" data-submit="${d.date}"
+                  ${isFuture ? "disabled" : ""}>✓ Submit / Finalize Attendance</button>
         </div>`;
     }
 
@@ -436,24 +510,47 @@ $("#weekGrid").addEventListener("click", async (e) => {
   const day = state.week.days.find((x) => x.date === iso);
   if (!day) return;
 
-  // slot chip: pending → present → absent → pending
-  const slot = e.target.closest(".slot");
-  if (slot && !slot.disabled) {
-    const sid = Number(slot.dataset.sid);
+  // Present / Absent steppers — LOCAL ONLY, nothing hits the database
+  const step = e.target.closest(".step[data-pa]");
+  if (step && !step.disabled) {
+    const sid = Number(step.dataset.sid);
     const entry = day.entries.find((x) => x.subject_id === sid);
     if (!entry) return;
-    const slots = buildSlots(entry);
-    const i = Number(slot.dataset.i);
-    slots[i] = slots[i] === null ? "p" : slots[i] === "p" ? "a" : null;
-    const present = slots.filter((v) => v === "p").length;
-    const absent = slots.filter((v) => v === "a").length;
+    const draft = draftFor(day);
+    const cur = draft.entries[sid];
+    let p = cur.p;
+    let a = cur.a;
+    if (step.dataset.pa === "p") p += Number(step.dataset.step);
+    else a += Number(step.dataset.step);
+    p = Math.max(0, Math.min(p, entry.lecture_count - a));   // p + a ≤ scheduled
+    a = Math.max(0, Math.min(a, entry.lecture_count - p));
+    draft.entries[sid] = { p, a };
+    draft.dirty = true;
+    renderWeek();
+    return;
+  }
+
+  // Submit / Finalize — ONE batch request for the entire day
+  const submit = e.target.closest("[data-submit]");
+  if (submit && !submit.disabled) {
+    const draft = draftFor(day);
+    const entries = Object.entries(draft.entries).map(([sid, v]) => ({
+      subject_id: Number(sid),
+      present_count: v.p,
+      absent_count: v.a,
+    }));
     state.busy = true;
     try {
-      await api("/api/attendance", {
+      const res = await api("/api/attendance/batch", {
         method: "POST",
-        body: JSON.stringify({ date: iso, subject_id: sid, present_count: present, absent_count: absent }),
+        body: JSON.stringify({ date: iso, entries }),
       });
+      draft.dirty = false;
+      toast(`✓ Attendance finalized for ${fmtDate(iso,
+        { weekday: "short", day: "numeric", month: "short" })} — ` +
+        `${res.saved} marked`, "ok");
       await loadWeek();
+      loadStats();
     } catch (err) {
       toast(err.message, "err");
     } finally {
@@ -462,23 +559,7 @@ $("#weekGrid").addEventListener("click", async (e) => {
     return;
   }
 
-  // reset one subject's marks for the day
-  const clearRow = e.target.closest("[data-clearrow]");
-  if (clearRow) {
-    const sid = Number(clearRow.dataset.clearrow);
-    state.busy = true;
-    try {
-      await api(`/api/attendance?date=${iso}&subject_id=${sid}`, { method: "DELETE" });
-      await loadWeek();
-    } catch (err) {
-      toast(err.message, "err");
-    } finally {
-      state.busy = false;
-    }
-    return;
-  }
-
-  // mark / undo holiday
+  // mark / undo holiday (immediate — clears the day's marks & local drafts)
   const holBtn = e.target.closest("[data-holiday]");
   if (holBtn) {
     const reason = (card.querySelector("[data-reason]") || {}).value || "";
@@ -488,6 +569,7 @@ $("#weekGrid").addEventListener("click", async (e) => {
         method: "POST",
         body: JSON.stringify({ date: iso, reason: reason.trim() || "Holiday" }),
       });
+      delete state.drafts[iso];
       toast(`${iso} marked as holiday — day cleared, nothing penalised`, "info");
       await loadWeek();
     } catch (err) {
@@ -503,6 +585,7 @@ $("#weekGrid").addEventListener("click", async (e) => {
     state.busy = true;
     try {
       await api(`/api/holidays/${iso}`, { method: "DELETE" });
+      delete state.drafts[iso];
       toast("Holiday removed — schedule visible again (marks were cleared)", "info");
       await loadWeek();
     } catch (err) {

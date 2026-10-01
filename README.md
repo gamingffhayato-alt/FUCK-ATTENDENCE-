@@ -53,7 +53,9 @@ holidays (date, reason) clear a day — excluded from "scheduled", never penalis
 │   ├── index.py                  # FastAPI app — exports `app` (routes + chatbot)
 │   ├── db.py                     # supabase client row layer + default subjects
 │   └── requirements.txt          # fastapi, supabase, groq (+ uvicorn, python-dotenv)
-├── database/schema.sql           # tables + RLS + seed of 12 subjects — run once
+├── database/schema.sql           # tables + RLS + seed of 12 subjects + baselines — run once
+├── database/clear_logs_keep_baseline.sql  # add initial_* columns, set baselines, wipe day logs
+├── import_university_data.py     # map a university PDF report onto the day-wise tables
 ├── smoke_test.py                 # self-test (in-memory PostgREST fake, no DB needed)
 ├── .env.example                  # template only — real keys live in Vercel env vars
 └── README.md
@@ -90,12 +92,37 @@ holidays (date, reason) clear a day — excluded from "scheduled", never penalis
 | POST | `/api/schedule` | **replace** a day `{date, entries:[{subject_id, lecture_count}]}` |
 | GET | `/api/week?start=` | full week payload for the Mark Attendance tab (snaps to Monday) |
 | POST | `/api/attendance` | `{date, subject_id, present_count, absent_count}` — validated against the scheduled count; 409 on holidays/unscheduled |
+| POST | `/api/attendance/batch` | **finalize a whole day in one request** `{date, entries[]}` — replace-day semantics, all-or-nothing validation |
 | DELETE | `/api/attendance?date=&subject_id=` | clear one subject's marks for a day |
+| POST | `/api/history/clear` | `{before?}` wipe `daily_schedule` + `attendance_log` — **subjects baseline never touched** |
 | POST | `/api/holiday` | `{date, reason?}` — mark holiday + clear the day's marks |
 | DELETE | `/api/holidays/{date}` | undo a holiday |
 | GET | `/api/stats?date=` | dashboard + subject-wise totals + today/tomorrow blocks |
 | POST | `/api/chat` | `{message, date?}` → **streams** plain-text reply |
 | GET | `/` · `/api` | health / rewrite connectivity checks |
+
+## Stats math (baseline + day-wise)
+
+Each subject row stores the **baseline** totals imported from your university
+portal (`initial_total` / `initial_present` / `initial_absent`). Everything is
+cumulative:
+
+```
+Overall Total   = initial_total   + Σ(day-log scheduled)
+Overall Present = initial_present + Σ(day-log present)
+Overall Absent  = initial_absent  + Σ(day-log absent)
+percentage      = 100 × Present / (Present + Absent)
+```
+
+- `pending` = day-log lectures not yet marked (the baseline is fully marked,
+  so it never adds phantom pending).
+- Marking a holiday excludes that date's schedule and clears its marks.
+- **Migrating an existing portal:** run `database/clear_logs_keep_baseline.sql`
+  once — it adds the baseline columns, stores the figures (163/111/52), and
+  wipes day-wise logs so tracking restarts from this week. Same operation is
+  available in the UI via **Manage Semester → "Clear Day-by-Day History
+  (Retain Baseline Stats)"**, or `POST /api/history/clear`
+  (`{"before": "YYYY-MM-DD"}` to keep recent weeks).
 
 ## The chatbot
 

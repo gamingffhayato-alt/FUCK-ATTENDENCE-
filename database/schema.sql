@@ -59,11 +59,15 @@ end $$;
 -- (The v2 weekly_schedule table is untouched and simply unused now;
 --  drop it manually if you like: drop table public.weekly_schedule cascade;)
 
--- 2) Subjects ------------------------------------------------
+-- 2) Subjects (baseline = cumulative totals imported from the
+--    university portal; day-wise tracking adds on top of these) ----
 create table if not exists public.subjects (
-    id         bigint generated always as identity primary key,
-    name       text not null unique,
-    created_at timestamptz not null default now()
+    id              bigint generated always as identity primary key,
+    name            text not null unique,
+    initial_total   integer not null default 0,   -- lectures conducted before day-wise tracking
+    initial_present integer not null default 0,
+    initial_absent  integer not null default 0,
+    created_at      timestamptz not null default now()
 );
 
 -- 3) How many lectures of each subject are scheduled on a date --
@@ -143,3 +147,27 @@ insert into public.subjects (name) values
     ('Computational & Quantum Physics Lab'),
     ('Computational Mathematics For Intelligent Systems')
 on conflict (name) do nothing;
+
+-- Baseline figures (same as database/clear_logs_keep_baseline.sql) —
+-- Overall Total   = initial_total   + Σ(day-log scheduled)
+-- Overall Present = initial_present + Σ(day-log present)
+-- Overall Absent  = initial_absent  + Σ(day-log absent)
+update public.subjects s
+set initial_total   = v.t,
+    initial_present = v.p,
+    initial_absent  = v.a
+from (values
+    ('Basics Of Computer and C Programming',              17, 15,  2),
+    ('Basics Of Computer and C Programming Lab',          12, 10,  2),
+    ('Front-End Web Development',                         18, 10,  8),
+    ('Front-End Web Development Lab',                     12,  5,  7),
+    ('Environmental Studies - I',                         12, 10,  2),
+    ('Communication & Professional Skills I',             16, 16,  0),
+    ('Mini Project-I',                                     1,  1,  0),
+    ('Fundamentals Of Intelligent & Autonomous Systems',  17, 12,  5),
+    ('Technical Training - Advance Programming In C',      0,  0,  0),
+    ('Computational & Quantum Physics',                   23, 13, 10),
+    ('Computational & Quantum Physics Lab',               12,  4,  8),
+    ('Computational Mathematics For Intelligent Systems', 23, 15,  8)
+) as v(name, t, p, a)
+where s.name = v.name;

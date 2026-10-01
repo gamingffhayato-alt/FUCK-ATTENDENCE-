@@ -154,6 +154,22 @@
           <span id="setupStatus" class="status" role="status"></span>
         </div>
       </div>
+
+      <div class="panel danger">
+        <div class="panel-head">
+          <h2>🧹 Clear day-by-day history</h2>
+          <span class="badge warn">Admin</span>
+        </div>
+        <p class="hint">
+          Deletes every row in <b>daily_schedule</b> and <b>attendance_log</b> so
+          day-wise tracking can restart from scratch — while your
+          <b>baseline stats</b> stored on <code>subjects</code>
+          (<code>initial_total</code> · <code>initial_present</code> ·
+          <code>initial_absent</code>) are kept. Dashboard &amp; Subject Stats stay
+          cumulative: <b>overall = baseline + day logs</b>.
+        </p>
+        <button id="clearHistory" class="btn danger" type="button">Clear Day-by-Day History (Retain Baseline Stats)</button>
+      </div>
     </section>
 
     <!-- ================= TAB 4: MARK ATTENDANCE (WEEK-BY-WEEK) ================= -->

@@ -62,12 +62,18 @@ def sb():
 
 
 def _friendly(exc: Exception) -> Exception:
-    """Turn 'table not found' into an actionable message."""
+    """Turn 'table/column not found' into an actionable message."""
     msg = str(exc)
     if "Could not find the table" in msg or "PGRST205" in msg:
         return TablesMissingError(
             "Supabase tables not found — run database/schema.sql in the "
             "Supabase SQL Editor, then retry."
+        )
+    if "PGRST204" in msg or "Could not find the column" in msg:
+        return TablesMissingError(
+            "Supabase schema is out of date — run "
+            "database/clear_logs_keep_baseline.sql in the Supabase SQL Editor "
+            "(adds the subjects baseline columns), then retry."
         )
     return exc
 
@@ -86,11 +92,14 @@ def _run(fn):
 # ---------------------------------------------------------------
 
 def get_subjects() -> list[dict]:
+    """All subjects, including baseline columns (initial_* may be absent on
+    databases that predate the baseline migration — callers use .get())."""
+
     def _q():
         return (
             sb()
             .table("subjects")
-            .select("id, name, created_at")
+            .select("*")
             .order("name")
             .execute()
             .data
@@ -303,6 +312,68 @@ def delete_attendance(iso_date: str, subject_id: int) -> bool:
             .execute()
         )
         return True
+
+    return _run(_q)
+
+
+def replace_attendance_for_date(iso_date: str, entries: list[dict]) -> list[dict]:
+    """Batch finalize: the submitted entries become the day's complete log
+    (subjects with 0/0 are unmarked). One delete + one insert."""
+
+    def _q():
+        c = sb()
+        c.table("attendance_log").delete().eq("date", iso_date).execute()
+        rows = [
+            {
+                "date": iso_date,
+                "subject_id": int(e["subject_id"]),
+                "present_count": int(e["present_count"]),
+                "absent_count": int(e["absent_count"]),
+            }
+            for e in entries
+            if int(e.get("present_count", 0)) + int(e.get("absent_count", 0)) > 0
+        ]
+        if rows:
+            c.table("attendance_log").insert(rows).execute()
+        return rows
+
+    return _run(_q)
+
+
+def clear_daily_history(before_iso: str | None = None) -> dict:
+    """Delete day-wise logs (attendance_log + daily_schedule) — optionally
+    only rows dated BEFORE `before_iso`. The `subjects` table (baseline
+    figures) is never touched. Pre-counted so results don't depend on the
+    DELETE response representation."""
+
+    def _q():
+        c = sb()
+
+        def count(table: str) -> int:
+            q = c.table(table).select("id")
+            if before_iso:
+                q = q.lt("date", before_iso)
+            else:
+                # Supabase rejects DELETE without a WHERE clause (21000);
+                # an always-true filter keeps the full-wipe variant working.
+                q = q.gte("date", "1900-01-01")
+            return len(q.execute().data or [])
+
+        n_sched = count("daily_schedule")
+        n_att = count("attendance_log")
+
+        q_s = c.table("daily_schedule").delete()
+        q_a = c.table("attendance_log").delete()
+        if before_iso:
+            q_s = q_s.lt("date", before_iso)
+            q_a = q_a.lt("date", before_iso)
+        else:
+            q_s = q_s.gte("date", "1900-01-01")
+            q_a = q_a.gte("date", "1900-01-01")
+        q_s.execute()
+        q_a.execute()
+
+        return {"schedule_rows": n_sched, "attendance_rows": n_att}
 
     return _run(_q)
 

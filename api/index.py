@@ -16,10 +16,12 @@ GET    /api/schedule?date=YYYY-MM-DD     one day's manual schedule
 POST   /api/schedule                     replace a day {date, entries[]}
 GET    /api/week?start=YYYY-MM-DD        full week payload (Mon..Sun) for Tab 4
 POST   /api/attendance                   {date, subject_id, present_count, absent_count}
+POST   /api/attendance/batch             finalize a whole day in ONE request (replace-day)
 DELETE /api/attendance?date=&subject_id= clear one subject's marks for a day
 POST   /api/holiday                      {date, reason?} + clear day (no penalty)
 DELETE /api/holidays/{date}              undo a holiday
-GET    /api/stats?date=YYYY-MM-DD        dashboard + subject-wise stats
+POST   /api/history/clear                {before?} wipe day-wise logs, keep subjects baseline
+GET    /api/stats?date=YYYY-MM-DD        cumulative = subjects.initial_* + day logs
 POST   /api/chat                         streaming Groq chatbot (stats-injected)
 """
 
@@ -98,6 +100,21 @@ class HolidayIn(BaseModel):
     reason: str = Field(default="Holiday", max_length=200)
 
 
+class BatchEntryIn(BaseModel):
+    subject_id: int = Field(ge=1)
+    present_count: int = Field(ge=0, le=20)
+    absent_count: int = Field(ge=0, le=20)
+
+
+class BatchIn(BaseModel):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    entries: list[BatchEntryIn] = Field(default_factory=list, max_length=100)
+
+
+class HistoryClearIn(BaseModel):
+    before: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
 class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -140,6 +157,16 @@ def _pct(present: int, absent: int) -> Optional[float]:
     return round(100.0 * present / marked, 1) if marked else None
 
 
+def _baseline(row: dict) -> dict:
+    """Baseline (pre-day-wise) totals stored on the subject row.
+    .get() keeps older databases (columns not yet added) working at 0."""
+    return {
+        "total": int(row.get("initial_total") or 0),
+        "present": int(row.get("initial_present") or 0),
+        "absent": int(row.get("initial_absent") or 0),
+    }
+
+
 def _monday(d: date) -> date:
     return d.fromordinal(d.toordinal() - d.weekday())
 
@@ -149,6 +176,12 @@ def _monday(d: date) -> date:
 # --------------------------------------------------------------------------
 
 def _build_stats(today_iso: str) -> dict:
+    """Cumulative stats: baseline (subjects.initial_*) + day-wise logs.
+
+        Overall Present = initial_present + Σ(day-log present)
+        Overall Absent  = initial_absent  + Σ(day-log absent)
+        Overall Total   = initial_total   + Σ(day-log scheduled)
+    """
     subjects = _run_db(db.get_subjects)
     sched_rows = _run_db(db.get_all_schedule_rows)
     att_rows = _run_db(db.get_all_attendance_rows)
@@ -156,50 +189,62 @@ def _build_stats(today_iso: str) -> dict:
     holiday_set = {h["date"] for h in holidays}
     names = {s["id"]: s["name"] for s in subjects}
 
-    agg: dict[int, dict] = {
-        s["id"]: {"id": s["id"], "name": s["name"],
-                  "scheduled": 0, "present": 0, "absent": 0}
-        for s in subjects
-    }
+    def slot_for(sid: int, name: str) -> dict:
+        return {
+            "id": sid, "name": name, "baseline": {"total": 0, "present": 0, "absent": 0},
+            "day_scheduled": 0, "day_present": 0, "day_absent": 0,
+        }
 
-    # scheduled counts only non-holiday dates
+    agg: dict[int, dict] = {}
+    for s in subjects:
+        agg[s["id"]] = {
+            "id": s["id"], "name": s["name"], "baseline": _baseline(s),
+            "day_scheduled": 0, "day_present": 0, "day_absent": 0,
+        }
+
+    # day-wise scheduled counts only from non-holiday dates
     for r in sched_rows:
         if r["date"] in holiday_set:
             continue
-        slot = agg.get(r["subject_id"])
-        if slot is None:
-            agg[r["subject_id"]] = slot = {
-                "id": r["subject_id"],
-                "name": names.get(r["subject_id"], f"Subject #{r['subject_id']}"),
-                "scheduled": 0, "present": 0, "absent": 0,
-            }
-        slot["scheduled"] += int(r["lecture_count"])
+        sid = r["subject_id"]
+        if sid not in agg:
+            agg[sid] = slot_for(sid, names.get(sid, f"Subject #{sid}"))
+        agg[sid]["day_scheduled"] += int(r["lecture_count"])
 
     for r in att_rows:
-        slot = agg.get(r["subject_id"])
-        if slot is None:
-            agg[r["subject_id"]] = slot = {
-                "id": r["subject_id"],
-                "name": names.get(r["subject_id"], f"Subject #{r['subject_id']}"),
-                "scheduled": 0, "present": 0, "absent": 0,
-            }
-        slot["present"] += int(r["present_count"])
-        slot["absent"] += int(r["absent_count"])
+        sid = r["subject_id"]
+        if sid not in agg:
+            agg[sid] = slot_for(sid, names.get(sid, f"Subject #{sid}"))
+        agg[sid]["day_present"] += int(r["present_count"])
+        agg[sid]["day_absent"] += int(r["absent_count"])
 
     subject_stats = []
     tot_sched = tot_p = tot_a = 0
+    base_t = base_p = base_a = 0
     for s in sorted(agg.values(), key=lambda x: x["name"].casefold()):
-        marked = s["present"] + s["absent"]
+        b = s["baseline"]
+        scheduled = b["total"] + s["day_scheduled"]
+        present = b["present"] + s["day_present"]
+        absent = b["absent"] + s["day_absent"]
+        marked = present + absent
         entry = {
-            **s,
+            "id": s["id"],
+            "name": s["name"],
+            "baseline": b,
+            "scheduled": scheduled,
+            "present": present,
+            "absent": absent,
             "marked": marked,
-            "pending": max(0, s["scheduled"] - marked),
-            "percentage": _pct(s["present"], s["absent"]),
+            "pending": max(0, scheduled - marked),
+            "percentage": _pct(present, absent),
         }
         subject_stats.append(entry)
-        tot_sched += s["scheduled"]
-        tot_p += s["present"]
-        tot_a += s["absent"]
+        tot_sched += scheduled
+        tot_p += present
+        tot_a += absent
+        base_t += b["total"]
+        base_p += b["present"]
+        base_a += b["absent"]
 
     def day_block(iso: str) -> dict:
         is_hol = iso in holiday_set
@@ -245,6 +290,7 @@ def _build_stats(today_iso: str) -> dict:
             "percentage": _pct(tot_p, tot_a),
             "holidays": len(holidays),
             "subjects": len(subjects),
+            "baseline": {"total": base_t, "present": base_p, "absent": base_a},
         },
         "subjects": subject_stats,
         "today": day_block(today.isoformat()),
@@ -546,6 +592,64 @@ def unmark_attendance(
 ):
     _run_db(lambda: db.delete_attendance(date, subject_id))
     return {"ok": True}
+
+
+@app.post("/api/attendance/batch")
+def mark_attendance_batch(body: BatchIn):
+    """Finalize a whole day in one request (Replace-Day semantics).
+
+    The submitted entries become the day's complete attendance log:
+    subjects sent with 0/0 are unmarked, subjects omitted from `entries`
+    are cleared for that date. No writes happen if any entry fails
+    validation (holiday / unscheduled / over-scheduled).
+    """
+    d = _parse_date(body.date)
+    iso = d.isoformat()
+
+    if _run_db(lambda: db.get_holiday(iso)):
+        raise HTTPException(status_code=409, detail=f"{iso} is a holiday — nothing to mark")
+
+    sched_map = {
+        r["subject_id"]: int(r["lecture_count"])
+        for r in _run_db(lambda: db.get_schedule_rows_for_date(iso))
+    }
+    names = {s["id"]: s["name"] for s in _run_db(db.get_subjects)}
+
+    for e in body.entries:
+        cnt = sched_map.get(e.subject_id)
+        if cnt is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"“{names.get(e.subject_id, f'#{e.subject_id}')}” has no classes "
+                       f"scheduled on {iso} — set the day's lectures in Manage Semester first.",
+            )
+        if e.present_count + e.absent_count > cnt:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Only {cnt} lecture(s) of "
+                       f"“{names.get(e.subject_id, f'#{e.subject_id}')}” scheduled on {iso} — "
+                       f"you tried to mark {e.present_count + e.absent_count}.",
+            )
+
+    saved = _run_db(lambda: db.replace_attendance_for_date(
+        iso, [e.model_dump() for e in body.entries]))
+    return {"ok": True, "date": iso, "saved": len(saved),
+            "entries": [{"subject_id": e.subject_id,
+                         "present_count": e.present_count,
+                         "absent_count": e.absent_count} for e in body.entries]}
+
+
+@app.post("/api/history/clear")
+def clear_history(body: Optional[HistoryClearIn] = None):
+    """Delete day-wise logs (daily_schedule + attendance_log), optionally only
+    rows dated before `before` (e.g. this week's Monday). The subjects table —
+    including baseline figures (initial_*) — is never modified."""
+    before = body.before if body else None
+    if before:
+        _parse_date(before)
+    counts = _run_db(lambda: db.clear_daily_history(before))
+    return {"ok": True, "before": before, "deleted": counts,
+            "baseline_preserved": True}
 
 
 # --------------------------------------------------------------------------

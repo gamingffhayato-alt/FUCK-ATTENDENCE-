@@ -79,6 +79,10 @@ class FakeTable:
         self._filters.append(("lte", col, val))
         return self
 
+    def lt(self, col, val):
+        self._filters.append(("lt", col, val))
+        return self
+
     def order(self, col, asc=True):
         self._order = (col, asc)
         return self
@@ -95,6 +99,8 @@ class FakeTable:
             if op == "gte" and not str(row.get(col)) >= str(val):
                 return False
             if op == "lte" and not str(row.get(col)) <= str(val):
+                return False
+            if op == "lt" and not str(row.get(col)) < str(val):
                 return False
         return True
 
@@ -258,6 +264,19 @@ def main():
           "attendance_log_v2_backup_pkey" in schema
           and "attendance_log_v2_backup_date_subject_unique" in schema)
 
+    mig = read("database/clear_logs_keep_baseline.sql")
+    check("baseline migration exists (initial_* columns)",
+          all(c in mig for c in ("initial_total", "initial_present", "initial_absent")))
+    check("migration wipes day logs, never subjects",
+          "delete from public.attendance_log" in mig
+          and "delete from public.daily_schedule" in mig
+          and "alter table public.subjects" in mig
+          and "delete from public.subjects" not in mig)
+    check("schema.sql carries baseline columns + values",
+          "initial_total" in schema and "initial_present" in schema)
+    check("full-wipe guard: always-true WHERE (supabase rejects bare DELETE)",
+          "1900-01-01" in read("api/db.py"))
+
     imp = read("import_university_data.py")
     check("university PDF import script present", "PDF_DATA" in imp)
     check("import script carries verified PDF totals (460/163/111/52/68.1)",
@@ -272,6 +291,11 @@ def main():
 
     js = read("app.js")
     check("frontend calls /api/chat", '"/api/chat"' in js)
+    check("frontend uses −/+ steppers", "data-step" in js and "step-count" in js)
+    check("frontend batch submit flow",
+          "/api/attendance/batch" in js and "Submit / Finalize Attendance" in js)
+    check("frontend admin clear-history button",
+          "clearHistory" in read("index.html") and "/api/history/clear" in js)
     check("CSS honours [hidden] (chat panel actually closes)",
           "[hidden] { display: none !important; }" in read("styles.css"))
     check("frontend has4 tabs + chat widget",
@@ -300,6 +324,12 @@ def main():
     r = client.get("/api")
     check("/api fallback route answers (Vercel connectivity check)",
           r.status_code == 200 and r.json().get("status") == "Attendance API is running", r.text)
+
+    r = client.post("/api/attendance/batch", json={})
+    check("batch route registered (422, not 404)", r.status_code == 422, str(r.status_code))
+    r = client.post("/api/history/clear", json={})
+    check("history/clear route registered",
+          r.status_code == 200 and r.json().get("baseline_preserved") is True, r.text)
 
     # ------------------------------------------------------------------
     print("\n[3] subjects CRUD + default seed")
@@ -492,6 +522,39 @@ def main():
           s["overall"]["scheduled"] == 6 and s["overall"]["present"] == 3, s["overall"])
 
     # ------------------------------------------------------------------
+    print("\n[7b] batch attendance (single-request day finalize)")
+    # TUE has subject A scheduled ×2 and no marks at this point
+    r = client.post("/api/attendance/batch", json={"date": TUE, "entries": [
+        {"subject_id": id_a, "present_count": 1, "absent_count": 1}]})
+    check("valid batch 200", r.status_code == 200, r.text)
+    rows = db.get_attendance_rows_for_date(TUE)
+    check("batch wrote the day's row",
+          len(rows) == 1 and rows[0]["present_count"] == 1 and rows[0]["absent_count"] == 1)
+
+    r = client.post("/api/attendance/batch", json={"date": TUE, "entries": [
+        {"subject_id": id_a, "present_count": 2, "absent_count": 1}]})
+    check("batch over-scheduled → 422", r.status_code == 422, r.text)
+    r = client.post("/api/attendance/batch", json={"date": TUE, "entries": [
+        {"subject_id": id_b, "present_count": 1, "absent_count": 0}]})
+    check("batch unscheduled subject → 422", r.status_code == 422, r.text)
+    r = client.post("/api/attendance/batch", json={"date": "06-10-2026", "entries": []})
+    check("batch bad date → 422", r.status_code == 422, str(r.status_code))
+    check("failed validations wrote nothing",
+          len(db.get_attendance_rows_for_date(TUE)) == 1,
+          db.get_attendance_rows_for_date(TUE))
+
+    r = client.post("/api/attendance/batch", json={"date": TUE, "entries": [
+        {"subject_id": id_a, "present_count": 0, "absent_count": 0}]})
+    check("0/0 batch unmarks (replace-day semantics)",
+          r.status_code == 200 and db.get_attendance_rows_for_date(TUE) == [], r.text)
+
+    client.post("/api/holiday", json={"date": TUE, "reason": "test"})
+    r = client.post("/api/attendance/batch", json={"date": TUE, "entries": [
+        {"subject_id": id_a, "present_count": 1, "absent_count": 0}]})
+    check("batch on holiday → 409", r.status_code == 409, r.text)
+    client.delete(f"/api/holidays/{TUE}")
+
+    # ------------------------------------------------------------------
     print("\n[8] chatbot streaming (Groq stubbed)")
     r = client.post("/api/chat", json={"message": "Can I bunk tomorrow?", "date": MON})
     check("chat 200", r.status_code == 200, r.text)
@@ -510,6 +573,78 @@ def main():
     check("chat without message → 422", r.status_code == 422, str(r.status_code))
     r = client.post("/api/chat", json={"message": "", "date": MON})
     check("empty message → 422", r.status_code == 422, str(r.status_code))
+
+    # ------------------------------------------------------------------
+    print("\n[9] baseline stats + clear history (retains baseline)")
+    BASELINE = {  # university portal figures (initial_total, initial_present, initial_absent)
+        "Basics Of Computer and C Programming": (17, 15, 2),
+        "Basics Of Computer and C Programming Lab": (12, 10, 2),
+        "Front-End Web Development": (18, 10, 8),
+        "Front-End Web Development Lab": (12, 5, 7),
+        "Environmental Studies - I": (12, 10, 2),
+        "Communication & Professional Skills I": (16, 16, 0),
+        "Mini Project-I": (1, 1, 0),
+        "Fundamentals Of Intelligent & Autonomous Systems": (17, 12, 5),
+        "Technical Training - Advance Programming In C": (0, 0, 0),
+        "Computational & Quantum Physics": (23, 13, 10),
+        "Computational & Quantum Physics Lab": (12, 4, 8),
+        "Computational Mathematics For Intelligent Systems": (23, 15, 8),
+    }
+    for row in db._client.store.get("subjects", []):
+        t, p, a = BASELINE[row["name"]]
+        row["initial_total"], row["initial_present"], row["initial_absent"] = t, p, a
+
+    # a row from LAST week proves the partial (before) filter
+    client.post("/api/schedule", json={"date": "2026-09-30",
+                                       "entries": [{"subject_id": id_b, "lecture_count": 2}]})
+    client.post("/api/attendance", json={"date": "2026-09-30", "subject_id": id_b,
+                                         "present_count": 1, "absent_count": 1})
+
+    r = client.post("/api/history/clear", json={"before": MON})
+    check("partial clear (before this week) 200", r.status_code == 200, r.text)
+    check("partial clear removed pre-week rows",
+          all(x["date"] >= MON for x in db._client.store["daily_schedule"])
+          and all(x["date"] >= MON for x in db._client.store["attendance_log"]),
+          db._client.store["daily_schedule"])
+    check("partial clear kept the current week",
+          any(x["date"] == MON for x in db._client.store["daily_schedule"]))
+
+    r = client.post("/api/history/clear", json={})
+    check("full clear 200", r.status_code == 200, r.text)
+    check("day logs wiped",
+          db._client.store["daily_schedule"] == []
+          and db._client.store["attendance_log"] == [])
+    check("subjects + baselines retained (12)",
+          len(db._client.store["subjects"]) == 12
+          and all(s.get("initial_total") is not None for s in db._client.store["subjects"]))
+
+    s = client.get(f"/api/stats?date={MON}").json()
+    o = s["overall"]
+    check("post-clear totals = baseline 163/111/52",
+          (o["scheduled"], o["present"], o["absent"]) == (163, 111, 52), o)
+    check("post-clear percentage 68.1", o["percentage"] == 68.1, o)
+    check("post-clear pending 0", o["pending"] == 0, o)
+    check("overall baseline object",
+          o["baseline"] == {"total": 163, "present": 111, "absent": 52}, o["baseline"])
+    sa = next(x for x in s["subjects"] if x["name"] == SUBJ_A)
+    check("subject cumulative from baseline 17/15/2 → 88.2%",
+          (sa["scheduled"], sa["present"], sa["absent"], sa["percentage"]) == (17, 15, 2, 88.2),
+          sa)
+    check("subject baseline object",
+          sa["baseline"] == {"total": 17, "present": 15, "absent": 2}, sa["baseline"])
+
+    # additive proof: one day-log on top of the baseline
+    client.post("/api/schedule", json={"date": MON,
+                                       "entries": [{"subject_id": id_a, "lecture_count": 3}]})
+    r = client.post("/api/attendance/batch", json={"date": MON, "entries": [
+        {"subject_id": id_a, "present_count": 2, "absent_count": 1}]})
+    check("batch works after clear", r.status_code == 200, r.text)
+    s = client.get(f"/api/stats?date={MON}").json()
+    o = s["overall"]
+    check("cumulative = baseline + day logs (166/113/53)",
+          (o["scheduled"], o["present"], o["absent"]) == (166, 113, 53), o)
+    check("cumulative percentage recomputed",
+          o["percentage"] == round(100 * 113 / 166, 1), o["percentage"])
 
     print(f"\n=== ALL {len(PASSED)} CHECKS PASSED ===")
 
