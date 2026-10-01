@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Attendance Portal — Day by Day</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📅</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📅</span>
+      <div>
+        <h1>Attendance Portal</h1>
+        <p class="sub">Precise day-by-day historical attendance tracking</p>
+      </div>
+    </div>
+    <div class="top-right">
+      <span id="envBadges" class="env-badges"></span>
+      <div id="topDate" class="date-pill">…</div>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="today" role="tab">📌 Today</button>
+    <button class="tab" data-tab="analytics" role="tab">📊 Analytics</button>
+    <button class="tab" data-tab="schedule" role="tab">🗓️ Schedule</button>
+  </nav>
+
+  <main>
+    <!-- ================= TODAY ================= -->
+    <section id="tab-today" class="tab-panel">
+      <div class="day-hero">
+        <div>
+          <p class="eyebrow">Today</p>
+          <h2 id="todayDate">Loading…</h2>
+        </div>
+        <div id="dayTags" class="day-tags"></div>
+      </div>
+
+      <div id="holidayBanner" class="banner holiday" hidden>
+        <span class="banner-icon">🌴</span>
+        <div class="banner-text">
+          <b id="holidayTitle">Today is a holiday</b>
+          <p id="holidayReasonText" class="muted">No classes will be penalised.</p>
+        </div>
+        <button id="undoHolidayBtn" class="btn ghost">↩ Undo holiday</button>
+      </div>
+
+      <div id="weekendBanner" class="banner weekend" hidden>
+        🗓️ <b>Weekend</b> — your timetable for this day (if any) is shown below.
+      </div>
+
+      <div id="dayClasses" class="class-list" aria-live="polite"></div>
+
+      <div id="freeDay" class="empty" hidden>
+        <div class="empty-icon">🌤️</div>
+        <p><b>Nothing scheduled for today</b></p>
+        <p class="muted">Upload your timetable in the <b>Schedule</b> tab and today's
+           classes will appear here automatically.</p>
+      </div>
+
+      <div id="holidayControls" class="holiday-controls">
+        <input id="holidayReasonInput" type="text" maxlength="200"
+               placeholder="Reason (optional) — e.g. Diwali, college function" />
+        <button id="holidayBtn" class="btn purple">🌴 Mark Today as Holiday</button>
+      </div>
+    </section>
+
+    <!-- ================= ANALYTICS ================= -->
+    <section id="tab-analytics" class="tab-panel" hidden>
+      <div class="toolbar">
+        <label class="range-label">Range
+          <select id="weeksSelect">
+            <option value="4">Last 4 weeks</option>
+            <option value="8" selected>Last 8 weeks</option>
+            <option value="12">Last 12 weeks</option>
+          </select>
+        </label>
+        <div id="anSummary" class="summary"></div>
+      </div>
+
+      <div id="weeksGrid" class="weeks-grid"></div>
+
+      <div id="anEmpty" class="empty" hidden>
+        <div class="empty-icon">📊</div>
+        <p><b>No attendance logged in this range</b></p>
+        <p class="muted">Mark Present/Absent on the Today tab to build your history.</p>
+      </div>
+    </section>
+
+    <!-- ================= SCHEDULE ================= -->
+    <section id="tab-schedule" class="tab-panel" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>📤 Upload timetable image</h2>
+          <span class="badge subtle">OCR → Groq openai/gpt-oss-20b</span>
+        </div>
+        <p class="hint">
+          Upload a photo/screenshot of your weekly timetable. The backend runs
+          <b>Tesseract OCR</b> on it and sends the extracted text to the Groq AI
+          model, which structures it day-by-day (Monday → Sunday) and saves it.
+        </p>
+
+        <div id="dropZone" class="dropzone" tabindex="0">
+          <input type="file" id="fileInput" accept="image/*" hidden />
+          <div id="dzIdle" class="dz-idle">
+            <span class="dz-icon">🖼️</span>
+            <p><b>Click to choose</b> or drop an image here</p>
+            <p class="muted">PNG · JPG · WEBP · BMP · TIFF (max 10 MB)</p>
+          </div>
+          <img id="preview" alt="Timetable preview" hidden />
+          <p id="fileName" class="muted" hidden></p>
+        </div>
+
+        <div class="row">
+          <button id="extractBtn" class="btn primary" disabled>⚡ Extract &amp; Save Schedule</button>
+          <span id="uploadStatus" class="status" role="status"></span>
+        </div>
+
+        <details class="fallback">
+          <summary>No image? Paste the text instead</summary>
+          <textarea id="scheduleText" rows="6" spellcheck="false"
+            placeholder="Monday&#10;Engineering Mathematics&#10;Physics&#10;&#10;Tuesday&#10;Engineering Mathematics&#10;Chemistry"></textarea>
+          <button id="parseTextBtn" class="btn" type="button">Parse pasted text</button>
+        </details>
+
+        <details id="ocrDetails" class="fallback" hidden>
+          <summary>Text extracted from your image</summary>
+          <pre id="ocrText" class="ocr-out"></pre>
+        </details>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>🗓️ Current weekly schedule</h2>
+          <button id="reloadSched" class="btn ghost" type="button">↻ Refresh</button>
+        </div>
+        <div id="scheduleGrid" class="schedule-grid"></div>
+        <div id="schedEmpty" class="empty" hidden>
+          <div class="empty-icon">🗂️</div>
+          <p><b>No schedule saved yet</b></p>
+          <p class="muted">Upload a timetable image above to populate your week.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    FastAPI · Tesseract OCR · Groq (openai/gpt-oss-20b) · Supabase PostgreSQL
+  </footer>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

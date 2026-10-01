@@ -1,0 +1,16 @@
+# secrets — never commit
+.env
+
+# runtime data
+attendance.db
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
