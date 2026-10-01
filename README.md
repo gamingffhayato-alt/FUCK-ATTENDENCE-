@@ -1,30 +1,30 @@
 # 📅 Attendance Portal — Vercel Single-Repo Deployment
 
-Day-by-day historical attendance tracking: **FastAPI + OCR.space + Groq (`openai/gpt-oss-20b`) + Supabase**,
-deployed as **one repository on Vercel** — static frontend at the root, backend as a
-Python serverless function under `/api/*`.
+Day-by-day historical attendance tracking: **FastAPI + Groq (`openai/gpt-oss-20b`) +
+Supabase**, deployed as **one repository on Vercel** — static frontend at the root,
+backend as a Python serverless function under `/api/*`.
+
+**OCR runs in your browser** with [Tesseract.js](https://github.com/naptha/tesseract.js)
+(the image never leaves your device); only the extracted *text* is sent to the backend.
 
 ```
 attendance-portal/                ← Vercel project root
-├── index.html                    # frontend (served as static files)
-├── app.js
+├── index.html                    # frontend (Tesseract.js CDN loaded in <head>)
+├── app.js                        # browser OCR → POST /api/schedule/text
 ├── styles.css
-├── vercel.json                   # @vercel/python build + /api routing + static
+├── vercel.json                   # /api rewrites + functions.maxDuration
 ├── api/                          # ← Vercel serverless functions
-│   ├── index.py                  # FastAPI app (formerly main.py) — exports `app`
-│   ├── ocr.py                    # image → text via OCR.space API (requests only)
+│   ├── index.py                  # FastAPI app — exports `app` (text-only intake)
 │   ├── groq_analyzer.py          # exact Groq streaming config (openai/gpt-oss-20b)
 │   ├── db.py                     # supabase client
-│   └── requirements.txt          # fastapi, requests, groq, supabase, …
+│   └── requirements.txt          # fastapi, uvicorn, groq, supabase, python-dotenv
 ├── database/schema.sql           # run once in Supabase SQL Editor
 ├── smoke_test.py                 # 38-check self-test
-├── test_timetable.png            # sample image to try uploads
 ├── .env / .env.example           # secrets (git-ignored)
 └── README.md
 ```
 
-> Replaced architecture: **no Docker / no Tesseract** — OCR is done by the free
-> hosted **OCR.space API**, which works inside Vercel's serverless sandbox.
+> No Docker, no Tesseract binary, no OCR API keys — the browser does the scanning.
 
 ---
 
@@ -40,11 +40,7 @@ Supabase Dashboard → **SQL Editor** → paste `database/schema.sql` → **Run*
 GROQ_API_KEY=gsk_…                                  # console.groq.com → API Keys
 SUPABASE_URL=https://<ref>.supabase.co              # Project Settings → API
 SUPABASE_KEY=sb_publishable_…                        # publishable or service key
-OCR_SPACE_API_KEY=helloworld                         # free key: https://ocr.space/ocrapi
 ```
-
-`OCR_SPACE_API_KEY=helloworld` is OCR.space's public **test** key (rate-limited) —
-register for your own personal key once you're using it regularly.
 
 ---
 
@@ -60,50 +56,41 @@ npm i -g vercel && vercel dev            # → http://localhost:3000
 uvicorn api.index:app --reload           # → http://localhost:8000/docs
 ```
 
-Self-test (no Vercel needed): `python smoke_test.py`
+Self-test: `python smoke_test.py`
 
 ---
 
 ## 3. Deploy to Vercel (single repo)
 
-1. **Push to GitHub** (project root = this folder):
-   ```bash
-   git init && git add -A && git commit -m "Attendance Portal"
-   git remote add origin https://github.com/<you>/attendance-portal.git
-   git push -u origin main
-   ```
-2. **Import** at <https://vercel.com/new> → select the repo → Framework preset
-   **Other** → don't change build settings (`vercel.json` already contains the
-   `/api` → `api/index.py` rewrites and `"maxDuration": 60`; static files are
-   served automatically).
-3. **Add environment variables** (Settings → Environment Variables):
-   `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `OCR_SPACE_API_KEY` — paste
-   the same values from your `.env`.
-4. **Deploy** → open `https://<project>.vercel.app`:
-   - `/` serves `index.html`; `app.js`/`styles.css` are static files;
-   - every `/api/*` request is routed by `vercel.json` to the FastAPI function
-     (`api/index.py`) — same origin, so **no CORS issues**;
-   - the Today/Analytics/Schedule tabs talk to Supabase, and timetable uploads
-     flow OCR.space → Groq → your database.
+1. **Push to GitHub** (`git add -A && git commit && git push`).
+2. **Import** at <https://vercel.com/new> → repo → preset **Other**
+   (`vercel.json` already contains the `/api` → `api/index.py` rewrites and
+   `"maxDuration": 60`; static files are served automatically).
+3. **Environment variables**: `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`.
+4. **Deploy** → open `https://<project>.vercel.app`.
 
 ---
 
-## 4. How the pieces work
+## 4. How it works
 
 | Piece | File | Notes |
 |---|---|---|
-| Static frontend | `index.html`, `app.js`, `styles.css` | served by Vercel's CDN; all fetches use relative `/api/...` paths |
-| Serverless function | `api/index.py` | exports `app = FastAPI(...)`; **no StaticFiles mount** (deleted — Vercel serves the frontend) |
-| OCR | `api/ocr.py` | base64 → `POST https://api.ocr.space/parse/image` with `OCR_SPACE_API_KEY`; returns parsed text; clear errors on failures. No pytesseract/Pillow/numpy |
+| Browser OCR | `index.html` + `app.js` | Tesseract.js v5 from jsDelivr; multi-pass page-segmentation (default → psm 4 → 6 → 11) with live "Scanning image on your device…" progress; **image is never uploaded** |
+| Frontend | `index.html`, `app.js`, `styles.css` | served by Vercel's CDN; all fetches use relative `/api/...` paths |
+| Serverless function | `api/index.py` | exports `app = FastAPI(...)`; text-only intake (`/api/schedule/text`); no StaticFiles mount |
 | AI | `api/groq_analyzer.py` | exact spec: `openai/gpt-oss-20b`, `temperature=1`, `max_completion_tokens=2048`, `top_p=1`, `reasoning_effort="medium"`, `stream=True` |
 | Database | `api/db.py` | supabase-py → `weekly_schedule` / `attendance_log` / `holidays` |
+
+**Schedule extraction flow:** choose image → browser OCR (Tesseract.js) →
+`POST /api/schedule/text` with the extracted text → Groq structures it into
+`{Monday: [...], …}` → `weekly_schedule` replaced in Supabase.
 
 **API reference**
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | groq / ocr / supabase status |
-| `GET` / `POST` | `/api/schedule`, `/api/schedule/upload`, `/api/schedule/text` | read / OCR+AI save / text-only save |
+| `GET` | `/api/health` | groq / supabase status (`client_ocr: "tesseract.js"`) |
+| `GET` / `POST` | `/api/schedule`, `/api/schedule/text` | read / save the parsed timetable |
 | `GET` | `/api/today?date=` | weekday filter + marks + holiday |
 | `POST` / `DELETE` | `/api/attendance` | log / remove a `(date, subject, status)` row |
 | `POST` / `DELETE` | `/api/holiday`, `/api/holidays/{date}` | mark / undo holiday |
@@ -113,16 +100,15 @@ Self-test (no Vercel needed): `python smoke_test.py`
 
 ## 5. Troubleshooting
 
-- **Upload fails with a clear503** → `OCR_SPACE_API_KEY` missing in Vercel env vars.
-- **413 / body too large** → Vercel caps request bodies ≈ 4.5 MB and OCR.space works
-  best with images ≤ ~1 MB — compress screenshots before uploading.
-- **Function timeout on upload** → `maxDuration: 60` is already set in
-  `vercel.json` for `api/index.py`; if the Hobby plan rejects it, Vercel
-  Settings → Functions lets you adjust it.
-- **Upload fails with OCR throttle (E551 / "helloworld … throttled")** → the
-  shared test key is rate-limited — register your own free key at
-  https://ocr.space/ocrapi and update `OCR_SPACE_API_KEY`.
+- **"Tesseract.js failed to load"** → the jsDelivr CDN was unreachable in the
+  browser; retry or swap the `<script>` URL for unpkg: `https://unpkg.com/tesseract.js@5/dist/tesseract.min.js`.
+- **Scan returns "No readable text"** → the multi-pass OCR found nothing;
+  use a brighter/clearer photo, or the *paste text instead* fallback.
+- **First scan is slow** → Tesseract.js downloads its WASM core + English
+  language data (a few MB) on first use, then it's cached by the browser.
+- **"Groq call failed: 401 Invalid API Key"** → your `GROQ_API_KEY` was revoked
+  or rotated — paste the fresh key into `.env` / Vercel env vars.
 - **503 "Supabase tables not found"** → run `database/schema.sql`.
-- **502 "Groq call failed"** → check `GROQ_API_KEY` and model access to `openai/gpt-oss-20b`.
-- **Old docs?** The previous Hugging Face/Docker/Tesseract setup is retired —
-  `Dockerfile`, `backend/README.md` and `pytesseract`/`Pillow`/`numpy` are gone.
+- **Function timeout** → `maxDuration: 60` is already set in `vercel.json`.
+- **Retired components** → `api/ocr.py`, OCR.space keys, `requests`,
+  `python-multipart` and the `/api/schedule/upload` route are all removed.

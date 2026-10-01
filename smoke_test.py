@@ -210,30 +210,16 @@ MON, SAT, PREV_MON = "2026-10-05", "2026-10-03", "2026-09-28"
 
 
 def main():
-    print("\n[1] schedule pipelines")
+    print("\n[1] schedule text pipeline (browser OCR sends text)")
     r = client.post("/api/schedule/text", json={"schedule_text": "Monday: Physics"})
     check("text pipeline 200", r.status_code == 200, r.text)
     check("weekly_schedule saved", db.get_schedule()["Monday"] == CANNED_MODEL_OUTPUT["Monday"])
+    check("extracted text echoed back", "Monday" in (r.json().get("extracted_text") or ""))
 
-    img_bytes = open(
-        "/home/user/attendance-portal/test_timetable.png", "rb"
-    ).read() if _has_sample() else None
-    if img_bytes:
-        r = client.post(
-            "/api/schedule/upload",
-            files={"file": ("timetable.png", img_bytes, "image/png")},
-        )
-        if r.status_code == 503 and "ocr.space" in r.text.lower():
-            # external dependency: the shared "helloworld" key gets throttled —
-            # not a code regression (set your own OCR_SPACE_API_KEY to avoid it)
-            print("  ~ SKIPPED image upload: OCR.space is throttling the shared test key "
-                  "(set your own OCR_SPACE_API_KEY)")
-        else:
-            check("image upload 200", r.status_code == 200, r.text)
-            body = r.json()
-            check("OCR text captured", "Monday" in body["extracted_text"])
-            check("schedule replaced from image",
-                  body["schedule"]["Tuesday"] == CANNED_MODEL_OUTPUT["Tuesday"])
+    # server-side image upload must be gone — OCR happens in the browser now
+    r = client.post("/api/schedule/upload",
+                    files={"file": ("t.png", b"\x89PNG\r\n\x1a\n", "image/png")})
+    check("upload route removed (404)", r.status_code == 404, str(r.status_code))
 
     print("\n[2] today: exact day filtering")
     r = client.get(f"/api/today?date={MON}")
@@ -320,8 +306,8 @@ def main():
 
     print("\n[6] health & root endpoint")
     r = client.get("/api/health").json()
-    check("health keys", all(k in r for k in ("groq", "ocr", "supabase")))
-    check("ocr ready", r["ocr"] is True)
+    check("health keys", all(k in r for k in ("groq", "supabase")))
+    check("health advertises browser OCR", r.get("client_ocr") == "tesseract.js")
     r = client.get("/")
     check("root health-check for uptime probes",
           r.status_code == 200 and r.json() == {"status": "Attendance API is running"},
@@ -337,11 +323,6 @@ def main():
           == ["Physics", "Chemistry"])
 
     print(f"\n=== ALL {len(PASSED)} CHECKS PASSED ===")
-
-
-def _has_sample() -> bool:
-    import os
-    return os.path.exists("/home/user/attendance-portal/test_timetable.png")
 
 
 if __name__ == "__main__":

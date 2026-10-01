@@ -407,39 +407,42 @@ async function runExtract(useText = false) {
   }
 
   btn.disabled = true;
-  status.textContent = useText
-    ? "Sending text to Groq AI…"
-    : "Running OCR → sending extracted text to Groq AI… (10–30 s)";
 
   try {
-    let data;
+    let scheduleText;
+
     if (useText) {
-      data = await api("/api/schedule/text", {
-        method: "POST",
-        body: JSON.stringify({ schedule_text: $("#scheduleText").value }),
-      });
+      status.textContent = "Sending text to Groq AI…";
+      scheduleText = $("#scheduleText").value.trim();
     } else {
-      const form = new FormData();
-      form.append("file", state.file, state.file.name);
-      const res = await fetch("/api/schedule/upload", { method: "POST", body: form });
-      data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        let msg = data.detail || `Upload failed (HTTP ${res.status})`;
-        if (Array.isArray(msg)) msg = msg.map((m) => m.msg || JSON.stringify(m)).join("; ");
-        throw new Error(msg);
+      // 1) OCR runs entirely in the browser (Tesseract.js) — no image upload
+      status.textContent = "Scanning image on your device (this may take a moment)...";
+      scheduleText = await ocrInBrowser(state.file);
+      if (!scheduleText) {
+        throw new Error(
+          "No readable text found in the image — try a clearer photo, or paste the text instead."
+        );
       }
+      // 2) send the browser-extracted text to the existing text endpoint
+      status.textContent = "Scan complete — sending extracted text to Groq AI…";
     }
 
-    state.schedule = data.schedule;
+    const data = await api("/api/schedule/text", {
+      method: "POST",
+      body: JSON.stringify({ schedule_text: scheduleText }),
+    });
+
+    state.schedule = (data && data.schedule) ? data.schedule : {};
     renderScheduleGrid();
 
-    if (data.extracted_text) {
-      $("#ocrText").textContent = data.extracted_text;
+    const shownText = (data && data.extracted_text) || scheduleText;
+    if (shownText) {
+      $("#ocrText").textContent = shownText;
       $("#ocrDetails").hidden = false;
       $("#ocrDetails").open = false;
     }
 
-    const count = Object.values(data.schedule).reduce((n, a) => n + a.length, 0);
+    const count = Object.values(state.schedule).reduce((n, a) => n + a.length, 0);
     status.textContent = "";
     toast(`Schedule saved ✓ ${count} lecture${count === 1 ? "" : "s"} across the week`, "ok");
     loadToday(); // today's list may have changed
@@ -449,6 +452,57 @@ async function runExtract(useText = false) {
   } finally {
     btn.disabled = useText ? false : !state.file;
   }
+}
+
+/* Local OCR via Tesseract.js (CDN script in index.html). Returns raw text.
+ *
+ * Runs up to 4 passes with different page-segmentation modes: the default
+ * works for most photos, but dense timetable grids sometimes only respond
+ * to a more specific mode. Stops as soon as a usable result is found. */
+async function ocrInBrowser(file) {
+  if (!window.Tesseract) {
+    throw new Error(
+      "Tesseract.js failed to load — check your internet connection (the CDN) and retry."
+    );
+  }
+
+  const attempts = [
+    {},                                  // Tesseract default (auto page segmentation)
+    { tessedit_pageseg_mode: "4" },      // single column — good for timetable grids
+    { tessedit_pageseg_mode: "6" },      // uniform block of text
+    { tessedit_pageseg_mode: "11" },     // sparse text
+  ];
+  const baseMsg = "Scanning image on your device (this may take a moment)";
+  let best = "";
+  let lastError = null;
+
+  for (let i = 0; i < attempts.length; i++) {
+    const suffix = i > 0 ? ` (pass ${i + 1}/${attempts.length})` : "";
+    try {
+      $("#uploadStatus").textContent = baseMsg + "..." + suffix;
+      const { data } = await window.Tesseract.recognize(file, "eng", {
+        ...attempts[i],
+        logger: (m) => {
+          if (m.status === "recognizing text" && typeof m.progress === "number") {
+            $("#uploadStatus").textContent =
+              baseMsg + "... " + Math.round(m.progress * 100) + "%" + suffix;
+          }
+        },
+      });
+      const text = ((data && data.text) ? data.text : "").trim();
+      if (text.length > best.length) best = text;
+      if (best.split(/\s+/).filter(Boolean).length >= 3) break; // usable — stop early
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!best && lastError) {
+    throw new Error(
+      "Browser OCR failed: " + (lastError && lastError.message ? lastError.message : String(lastError))
+    );
+  }
+  return best;
 }
 
 /* ---------------- boot ---------------- */
@@ -463,12 +517,10 @@ async function runExtract(useText = false) {
     badges.push(h.groq
       ? `<span class="badge">🤖 Groq ready</span>`
       : `<span class="badge warn">🤖 Groq offline</span>`);
-    badges.push(h.ocr
-      ? `<span class="badge">🔍 OCR ready</span>`
-      : `<span class="badge warn">🔍 OCR missing</span>`);
     badges.push(h.supabase
       ? `<span class="badge">🗄️ Supabase</span>`
       : `<span class="badge warn">🗄️ No Supabase URL</span>`);
+    badges.push(`<span class="badge">🧠 OCR in browser</span>`);
     $("#envBadges").innerHTML = badges.join("");
   }).catch(() => {});
 

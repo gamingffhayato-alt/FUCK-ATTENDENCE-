@@ -1,12 +1,13 @@
 """
 Attendance Tracking Portal — FastAPI backend (day-by-day historical).
 
+OCR now runs in the BROWSER (Tesseract.js) — this server only receives text.
+
 Routes
 ------
-GET    /api/health                     config status (groq / supabase / ocr)
+GET    /api/health                     config status (groq / supabase)
 GET    /api/schedule                   current weekly schedule
-POST   /api/schedule/upload            image file -> OCR -> Groq -> weekly_schedule
-POST   /api/schedule/text              raw text (no image) -> Groq -> weekly_schedule
+POST   /api/schedule/text              browser-extracted text -> Groq -> weekly_schedule
 GET    /api/today?date=YYYY-MM-DD      today's date/day + only today's subjects
 POST   /api/attendance                 {date, subject_name, status} log a record
 DELETE /api/attendance?date=&subject_name=   undo a record
@@ -24,23 +25,16 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Vercel runs this file as the serverless entrypoint — make sibling modules
-# (db.py, ocr.py, groq_analyzer.py) importable regardless of the working dir.
+# (db.py, groq_analyzer.py) importable regardless of the working dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import db  # noqa: E402
 from db import DAYS, TablesMissingError  # noqa: E402
-from ocr import (  # noqa: E402
-    ALLOWED_EXTENSIONS,
-    MAX_IMAGE_BYTES,
-    OcrUnavailableError,
-    extract_text,
-    ocr_available,
-)
 
 # Groq module builds its own client from .env (import error => server still boots)
 GROQ_IMPORT_ERROR: Optional[str] = None
@@ -215,12 +209,12 @@ def health():
         "groq_error": GROQ_IMPORT_ERROR,
         "groq_model": "openai/gpt-oss-20b",
         "supabase": bool(os.getenv("SUPABASE_URL", "").strip()),
-        "ocr": ocr_available(),
+        "client_ocr": "tesseract.js",  # OCR runs in the browser now
     }
 
 
 # --------------------------------------------------------------------------
-# Schedule: upload image (OCR + AI) or raw text
+# Schedule (text only — images are OCR'd client-side by Tesseract.js)
 # --------------------------------------------------------------------------
 
 @app.get("/api/schedule")
@@ -228,40 +222,9 @@ def get_schedule():
     return {"schedule": _run_db(db.get_schedule)}
 
 
-@app.post("/api/schedule/upload")
-async def upload_schedule(file: UploadFile = File(...)):
-    ext = Path(file.filename or "").suffix.lower()
-    if ext and ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Use an image: "
-                   + ", ".join(sorted(ALLOWED_EXTENSIONS)),
-        )
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=422, detail="Empty file")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Image larger than 10 MB")
-
-    try:
-        text = extract_text(data)
-    except OcrUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    if not text.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="OCR found no readable text in that image — try a clearer photo, "
-                   "or use 'paste text instead'.",
-        )
-    return _analyze_and_save(text, source="image-ocr")
-
-
 @app.post("/api/schedule/text")
 def schedule_from_text(body: TextIn):
-    """Fallback path: text pasted directly (skips OCR, still uses Groq)."""
+    """Receive text extracted in the browser and send it to Groq."""
     return _analyze_and_save(body.schedule_text.strip(), source="text")
 
 

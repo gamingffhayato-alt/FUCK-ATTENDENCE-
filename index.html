@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Attendance Portal — Day by Day</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📅</text></svg>" />
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -95,12 +96,13 @@
       <div class="panel">
         <div class="panel-head">
           <h2>📤 Upload timetable image</h2>
-          <span class="badge subtle">OCR → Groq openai/gpt-oss-20b</span>
+          <span class="badge subtle">Tesseract.js → Groq openai/gpt-oss-20b</span>
         </div>
         <p class="hint">
-          Upload a photo/screenshot of your weekly timetable. The backend runs
-          <b>Tesseract OCR</b> on it and sends the extracted text to the Groq AI
-          model, which structures it day-by-day (Monday → Sunday) and saves it.
+          Upload a photo/screenshot of your weekly timetable. Your browser scans it
+          locally with <b>Tesseract.js</b> (the image never leaves your device), then
+          sends the extracted text to the Groq AI model, which structures it
+          day-by-day (Monday → Sunday) and saves it.
         </p>
 
         <div id="dropZone" class="dropzone" tabindex="0">
@@ -108,7 +110,7 @@
           <div id="dzIdle" class="dz-idle">
             <span class="dz-icon">🖼️</span>
             <p><b>Click to choose</b> or drop an image here</p>
-            <p class="muted">PNG · JPG · WEBP · BMP · TIFF (max 10 MB)</p>
+            <p class="muted">PNG · JPG · WEBP · BMP · TIFF — scanned in your browser, never uploaded</p>
           </div>
           <img id="preview" alt="Timetable preview" hidden />
           <p id="fileName" class="muted" hidden></p>
@@ -148,7 +150,7 @@
   </main>
 
   <footer class="foot">
-    FastAPI · Tesseract OCR · Groq (openai/gpt-oss-20b) · Supabase PostgreSQL
+    FastAPI · Tesseract.js (in-browser OCR) · Groq (openai/gpt-oss-20b) · Supabase PostgreSQL
   </footer>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
