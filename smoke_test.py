@@ -258,6 +258,11 @@ def main():
           "attendance_log_v2_backup_pkey" in schema
           and "attendance_log_v2_backup_date_subject_unique" in schema)
 
+    imp = read("import_university_data.py")
+    check("university PDF import script present", "PDF_DATA" in imp)
+    check("import script carries verified PDF totals (460/163/111/52/68.1)",
+          all(t in imp for t in ("460", "163", "111", "52", "68.1")))
+
     vc = json.loads(read("vercel.json"))
     srcs = [r.get("source") for r in vc.get("rewrites", [])]
     check("vercel.json rewrites /api/(.*)", "/api/(.*)" in srcs)

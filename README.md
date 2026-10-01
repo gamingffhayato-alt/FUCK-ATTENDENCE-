@@ -110,6 +110,28 @@ holidays (date, reason) clear a day — excluded from "scheduled", never penalis
 - Frontend reads the body with `ReadableStream` and paints tokens as they
   land; errors surface as a red bubble (502 `Groq call failed: …`).
 
+## Import your existing university data
+
+`import_university_data.py` maps a university attendance printout (like the
+Quantum University PDF) onto the day-by-day tables:
+
+```bash
+python3 import_university_data.py --dry-run   # preview — writes nothing
+python3 import_university_data.py             # clear window & import
+```
+
+- **Totals are exact** — verified against the PDF header: 460 scheduled,
+  163 conducted, 111 present, 52 absent → **68.1%**, and all 12 per-subject
+  rows match.
+- The PDF carries **no dates**, so days are a plausible reconstruction over
+  weekdays **2026-08-03 → 2026-12-18**: conducted lectures are placed in the
+  past and fully marked (absences interleaved, totals preserved); the
+  remaining plan goes to future dates as unmarked/pending. Weekends are
+  excluded and no holidays are set.
+- A real run first **deletes schedule/attendance rows inside that window**
+  (this clears test entries), then upserts — re-runs are safe and
+  deterministic. Dates outside the window are untouched.
+
 ## Smoke test
 
 ```bash
